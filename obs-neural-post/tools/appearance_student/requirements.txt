@@ -1,0 +1,8 @@
+# Offline development tools only. Native viewer/OBS does not import Python.
+# Recorded environment: torch 2.15.0, coremltools 9.0. That torch version is
+# outside coremltools' advertised tested range; specific export parity is checked.
+torch>=2.7
+coremltools==9.0
+numpy
+Pillow
+safetensors

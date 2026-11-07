@@ -1,0 +1,149 @@
+diff --git a/Sources/DLSSMLX/NeuralRenderingTransformerOperations.swift b/Sources/DLSSMLX/NeuralRenderingTransformerOperations.swift
+index abb8108..1df51b2 100644
+--- a/Sources/DLSSMLX/NeuralRenderingTransformerOperations.swift
++++ b/Sources/DLSSMLX/NeuralRenderingTransformerOperations.swift
+@@ -888,7 +888,11 @@ struct NeuralRenderingFirstDecoderStage {
+ 
+   func callAsFunction(_ input: MLXArray, skip: MLXArray) -> MLXArray {
+     let split = splitBlocks.reduce(input) { value, block in block(value) }
+-    return blocks(upsample(split, skip: skip))
++    return afterSplit(split, skip: skip)
++  }
++
++  func afterSplit(_ input: MLXArray, skip: MLXArray) -> MLXArray {
++    blocks(upsample(input, skip: skip))
+   }
+ }
+ 
+@@ -972,6 +976,13 @@ struct NeuralRenderingDecoder {
+     let thirdOutput = third(secondOutput, skip: skips[1])
+     return fourth(thirdOutput, skip: skips[0])
+   }
++
++  func afterSplit(_ input: MLXArray, skips: [MLXArray]) -> MLXArray {
++    precondition(skips.count == 4)
++    let a = first.afterSplit(input, skip: skips[3])
++    let b = second(a, skip: skips[2])
++    return fourth(third(b, skip: skips[1]), skip: skips[0])
++  }
+ }
+ 
+ struct NeuralRenderingPostBlock {
+diff --git a/Sources/DLSSMLX/MLXFullFrameRenderer.swift b/Sources/DLSSMLX/MLXFullFrameRenderer.swift
+new file mode 100644
+index 0000000..5fa5ea9
+--- /dev/null
++++ b/Sources/DLSSMLX/MLXFullFrameRenderer.swift
+@@ -0,0 +1,30 @@
++import Foundation
++import DLSSCore
++import MLX
++
++/// Device-resident full-frame model for a single owning capture worker.
++/// Same implementation and precision as MLXNeuralRenderer metal-fused.
++public final class MLXFullFrameRenderer {
++  private let model: NeuralRenderingTransformerModel
++  public let blockCount: Int
++  public let networkDescription: String
++  private let width: Int
++  private let height: Int
++  public init(packageURL: URL, networkWidth: Int = 1280, networkHeight: Int = 768) throws {
++    guard networkWidth >= 128, networkHeight >= 128,
++      networkWidth.isMultiple(of:64), networkHeight.isMultiple(of:64) else {
++      throw MLXBackendError.unsupportedSpatialShape(architecture:"mlxdlss.neural-rendering-transformer.v1",height:networkHeight,width:networkWidth,minimum:128,multiple:64)
++    }
++    width = networkWidth; height = networkHeight
++    let package = try ModelPackageLoader.load(url: packageURL)
++    let weights = try SafeTensorValidation.loadAndValidate(package: package).cast(to: .float16)
++    let topology = try NeuralRenderingTopology.infer(weights: weights)
++    blockCount = topology.blockCount
++    networkDescription = topology.description
++    model = try NeuralRenderingTransformerModel(weights: weights, compileBlocks: true, topology: topology)
++  }
++  public func callAsFunction(_ input: MLXArray) -> MLXArray {
++    precondition(input.shape == [1,height,width,16] && input.dtype == .float16)
++    return model(input)
++  }
++}
+diff --git a/Sources/DLSSMLX/MLXStageSplit.swift b/Sources/DLSSMLX/MLXStageSplit.swift
+new file mode 100644
+index 0000000..2098ae5
+--- /dev/null
++++ b/Sources/DLSSMLX/MLXStageSplit.swift
+@@ -0,0 +1,76 @@
++import Foundation
++import DLSSCore
++import MLX
++
++/// Experimental, serial-worker API. The immutable context owns this frame's
++/// skips until both inference islands finish. Never reuse it for a later frame.
++public final class MLXStageSplitContext {
++  let encoded: NeuralRenderingEncoderOutput
++  public var centerInput: MLXArray { encoded.latent }
++  init(_ encoded: NeuralRenderingEncoderOutput) { self.encoded = encoded }
++}
++
++public final class MLXGlobalSplitContext {
++  let skip: MLXArray
++  public let input: MLXArray
++  init(skip: MLXArray, input: MLXArray) { self.skip = skip; self.input = input }
++}
++
++/// GPU blocks 0...22 and 48...70 surround an external blocks23...47 island.
++/// Same HT weights, padding, E4M3 publications and skip connections.
++public final class MLXStageSplit {
++  private let encoder: NeuralRenderingEncoder
++  private let splitEncoder: NeuralRenderingSplitEncoderStage
++  private let global: NeuralRenderingGlobalStage
++  private let bridge: NeuralRenderingDecoderInput
++  private let splitDecoder: [NeuralRenderingSplitWindowBlock]
++  private let decoder: NeuralRenderingDecoder
++  private let post: NeuralRenderingPostBlock
++
++  public init(packageURL: URL) throws {
++    let package = try ModelPackageLoader.load(url: packageURL)
++    let weights = try SafeTensorValidation.loadAndValidate(package: package).cast(to: .float16)
++    let topology = try NeuralRenderingTopology.infer(weights: weights)
++    guard topology == .ht else { throw MLXBackendError.unsupportedTopology("Stage split requires 71-block HT") }
++    encoder = try NeuralRenderingEncoder(weights: weights, compileBlocks: true, topology: topology)
++    splitEncoder = try NeuralRenderingSplitEncoderStage(weights: weights, fusedFeedForward: true, topology: topology)
++    global = try NeuralRenderingGlobalStage(weights: weights, fusedOperations: true, compileGraph: true, topology: topology)
++    bridge = try NeuralRenderingDecoderInput(weights: weights, topology: topology)
++    splitDecoder = try topology.splitDecoder.map {
++      try NeuralRenderingSplitWindowBlock(weights: weights, blockIndex: $0, preciseAttention: true, fusedFeedForward: true, topology: topology)
++    }
++    decoder = try NeuralRenderingDecoder(weights: weights, compileBlocks: true, topology: topology)
++    post = try NeuralRenderingPostBlock(weights: weights, compileBlocks: true, topology: topology)
++  }
++
++  public func begin(_ features: MLXArray) -> MLXStageSplitContext {
++    precondition(features.shape == [1,768,1280,16] && features.dtype == .float16)
++    let encoded = encoder(features)
++    eval(encoded.fullResolutionSkip, encoded.latent)
++    encoded.skips.forEach { eval($0) }
++    precondition(encoded.latent.shape == [1,24,40,512])
++    return MLXStageSplitContext(encoded)
++  }
++
++  public func referenceCenter(_ context: MLXStageSplitContext) -> MLXArray {
++    let split = beginGlobal(context)
++    return finishGlobal(split, latent: global(split.input))
++  }
++
++  public func beginGlobal(_ context: MLXStageSplitContext) -> MLXGlobalSplitContext {
++    let split = splitEncoder(context.centerInput)
++    eval(split.skip, split.latent)
++    return MLXGlobalSplitContext(skip: split.skip, input: split.latent)
++  }
++
++  public func finishGlobal(_ context: MLXGlobalSplitContext, latent: MLXArray) -> MLXArray {
++    let merged = bridge(latent, skip: context.skip)
++    return splitDecoder.reduce(merged) { value, block in block(value) }
++  }
++
++  public func finish(_ context: MLXStageSplitContext, center: MLXArray) -> MLXArray {
++    precondition(center.shape == [1,24,40,512] && center.dtype == .float16)
++    let decoded = decoder.afterSplit(center, skips: context.encoded.skips)
++    return post(decoded, skip: context.encoded.fullResolutionSkip)
++  }
++}

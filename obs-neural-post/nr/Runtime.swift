@@ -1,0 +1,173 @@
+import AppKit
+import CoreVideo
+import Foundation
+import Metal
+import MLX
+
+public final class ProcessedFrame {
+ public let pixels:CVPixelBuffer,texture:MTLTexture,sequence:UInt64,sourceSeconds:Double
+ public let processingMS:Double,gpuMS:Double,aneMS:Double
+ public var presentationID:UInt64=0
+ public var generated=false,phase:Double=1
+ public var pairStart:UInt64=0,pairEnd:UInt64=0
+ public var validation=false
+ var motionGuide:CaptureGuide?
+ public var captureGuided=false
+ public var sourcePixels:CVPixelBuffer?
+ public var stages:[String:Double]=[:]
+ public var variants:[String:CVPixelBuffer]=[:]
+ public let neural=true,appearance=true
+ init(_ p:CVPixelBuffer,_ t:MTLTexture,_ seq:UInt64,_ pts:Double,_ ms:Double,_ gpu:Double,_ ane:Double=0) {pixels=p;texture=t;sequence=seq;sourceSeconds=pts;processingMS=ms;gpuMS=gpu;aneMS=ane}
+}
+public struct NRStats {
+ public var submitted:UInt64=0,superseded:UInt64=0,completed:UInt64=0,neuralCompleted:UInt64=0,appearanceCompleted:UInt64=0,failed:UInt64=0
+ public var error="",busy=false
+}
+/// All source instances share one MLX executor. Each retains at most one pending
+/// capture; settings changes invalidate publication of the old configuration.
+public final class PostPipeline {
+ private static let worker=DispatchQueue(label:"obs.dlss-nr.mlx",qos:.userInitiated)
+ public let device:MTLDevice
+ public let experimentalAppearance=false
+ private let lock=NSLock()
+ private var configuration:NRConfiguration
+ private var engine:ThreeModeEngine?,engineConfiguration:NRConfiguration?
+ private let guideRing:CaptureGuideRing
+ private let pairEvidence=LiveFrameDiagnostics()
+ private var pending:(CVPixelBuffer,UInt64,Double,UInt64,CaptureGuide?)?
+ private var epoch:UInt64=0,stopped=false
+ private var frame:ProcessedFrame?,state=NRStats()
+ private var history:[[String:Any]]=[]
+ private var appleInterpolator:AppleFGService?,appleEpoch:UInt64=UInt64.max
+ private var interpolator:MultiFrameInterpolator?,interpolatorPath="",interpolatorEpoch:UInt64=UInt64.max
+ private var schedule=FrameSchedule<ProcessedFrame>(),nextPresentationID:UInt64=0
+ private var guidedCount:UInt64=0
+ private var generatedCount:UInt64=0,interpolationFailures:UInt64=0,pairResets:UInt64=0
+ private var interpolationError=""
+ private var warpParity = -1
+ private var nativePresentation:[String:Any]=[:]
+ private var overlayEnabled=false
+ public func setStatusOverlay(_ enabled:Bool){lock.lock();overlayEnabled=enabled;lock.unlock()}
+ public var statusOverlayText:String? {lock.lock();defer{lock.unlock()};return overlayEnabled ? (configuration.enabled ? "DLSS ON":"DLSS OFF") : nil}
+ public func reportPresentation(_ report:[String:Any]) {lock.lock();nativePresentation=report;lock.unlock()}
+
+ public var modeLabel:String {lock.lock();defer{lock.unlock()};return configuration.title+" ·480p →1080p ·"+configuration.frameGenerationBackend+(configuration.captureGuided ? " capture-guided":" synthetic")+" ·MFG≤\(configuration.frameGenerationFactor)x"}
+ public var presentationGeneration:UInt64 {lock.lock();defer{lock.unlock()};return epoch}
+ public var stats:NRStats {lock.lock();defer{lock.unlock()};return state}
+ public func latest()->ProcessedFrame? {presentationFrame(at:ProcessInfo.processInfo.systemUptime)}
+ public func presentationFrame(at target:Double)->ProcessedFrame? {
+  lock.lock();defer{lock.unlock()}
+  guard configuration.frameGenerationFactor>1 else {return frame}
+  let now=ProcessInfo.processInfo.systemUptime
+  _ = schedule.sample(at:now)
+  return schedule.peek(at:min(now+1.0/30,max(now,target)))
+ }
+ package init(_ config:NRConfiguration)throws {
+  guard let device=MTLCreateSystemDefaultDevice() else {throw NSError(domain:"DLSS NR",code:2)}
+  self.device=device;guideRing=CaptureGuideRing(device:device);configuration=try config.checked()
+ }
+ package func update(_ config:NRConfiguration) {
+  lock.lock();defer{lock.unlock()}
+  guard config != configuration else {return}
+  configuration=config;epoch &+= 1;guideRing.clear();pending=nil;frame=nil;history.removeAll();schedule.clear();state.error="";interpolationError="";warpParity = -1
+ }
+ public func submit(_ pixels:CVPixelBuffer,sequence:UInt64,sourceSeconds:Double) {
+  lock.lock();let copyGuides=configuration.captureGuided && configuration.frameGenerationFactor>1;let generation=epoch;let active = !stopped;lock.unlock()
+  guard active else{return}
+  let guide=copyGuides ? guideRing.copy(pixels,sequence:sequence,seconds:sourceSeconds) : nil
+  lock.lock()
+  guard !stopped && generation==epoch else {lock.unlock();return}
+  state.submitted &+= 1
+  if pending != nil {state.superseded &+= 1}
+  pending=(pixels,sequence,sourceSeconds,epoch,guide)
+  let start = !state.busy
+  if start {state.busy=true}
+  lock.unlock()
+  if start {Self.worker.async {[self] in drain()}}
+ }
+ private func drain() {
+  while true {
+   lock.lock()
+   guard !stopped,let work=pending else {pending=nil;state.busy=false;lock.unlock();return}
+   pending=nil;let config=configuration;lock.unlock()
+   autoreleasepool {
+    do {
+     if engineConfiguration?.mode != config.mode || engineConfiguration?.model71 != config.model71 || engineConfiguration?.model31 != config.model31 || engineConfiguration?.srPath != config.srPath {
+      engine=nil
+      engine=try ThreeModeEngine(device:device,srURL:URL(fileURLWithPath:config.srPath),configuration:config)
+     } else {engine?.configure(config)}
+     engineConfiguration=config
+     let began=ProcessInfo.processInfo.systemUptime
+     let result=try engine!.process(work.0,work.1,work.2)
+     // Playback retains output surfaces only. Holding capture buffers across
+     // the jitter reserve can exhaust AVFoundation's finite capture pool.
+     result.sourcePixels=nil;result.motionGuide=work.4
+     let guides=config.captureGuided ? guideRing.snapshot().filter{$0.seconds>=result.sourceSeconds-0.25 && $0.seconds<=result.sourceSeconds} : []
+     var generated:[ProcessedFrame]=[],fgMS=0.0,reset=false,difference=0.0,fgError="",parity = -1
+     if config.frameGenerationFactor>1 {
+      do {
+       let output:MultiFrameInterpolator.Result
+       if config.frameGenerationBackend=="apple" {
+        if #available(macOS 15.4,*) {
+         if appleInterpolator==nil {appleInterpolator=AppleFGService(device:device)}
+         if let native=appleInterpolator?.ready() as? AppleFrameInterpolator {
+          if appleEpoch != work.3 {native.reset();appleEpoch=work.3}
+          output=try native.generate(result,factor:config.frameGenerationFactor,guides:guides,guided:config.captureGuided)
+         } else {output = .init(frames:[],milliseconds:0,cut:true,difference:0,validationMaxDelta:-1)}
+        } else {throw NSError(domain:"AppleFG",code:1)}
+       } else {
+       if interpolator==nil || interpolatorPath != config.frameGenerationPath {
+        interpolator=try MultiFrameInterpolator(device:device,path:config.frameGenerationPath)
+        interpolatorPath=config.frameGenerationPath
+       }
+       interpolator?.setResolution(height:config.frameGenerationHeight)
+       if interpolatorEpoch != work.3 {interpolator?.reset();interpolatorEpoch=work.3}
+       output=try interpolator!.generate(result,factor:config.frameGenerationFactor,guides:guides,guided:config.captureGuided)
+       }
+       generated=output.frames;fgMS=output.milliseconds;reset=output.cut;difference=output.difference;parity=output.validationMaxDelta
+      } catch {fgError=String(describing:error);interpolator?.reset();if #available(macOS 15.4,*),let native=appleInterpolator?.ready() as? AppleFrameInterpolator {native.reset()};reset=true}
+     } else {interpolator?.reset();interpolatorEpoch=UInt64.max}
+     pairEvidence.submit(work.0,result,config,work.3,generated,guides)
+     let ready=ProcessInfo.processInfo.systemUptime
+     lock.lock()
+     if !stopped && work.3==epoch {
+      let previousSource=frame?.sourceSeconds
+      for packet in generated+[result] {nextPresentationID &+= 1;packet.presentationID=nextPresentationID}
+      if config.frameGenerationFactor>1 {
+       schedule.enqueue(generated+[result],at:ready,interval:previousSource.map{result.sourceSeconds-$0} ?? 0,reset:reset,sourceEnd:result.sourceSeconds,sourceTimes:(generated+[result]).map{$0.sourceSeconds})
+       generatedCount &+= UInt64(generated.count);guidedCount &+= UInt64(generated.filter{$0.captureGuided}.count)
+       if reset {pairResets &+= 1}
+       if !fgError.isEmpty {interpolationFailures &+= 1}
+       interpolationError=fgError
+      if parity>=0 {warpParity=parity}
+      }
+      frame=result;state.completed &+= 1;state.neuralCompleted &+= 1
+      if config.appliesNR {state.appearanceCompleted &+= 1}
+      state.error=""
+      history.append(["mode":config.mode,"sequence":work.1,"completedAt":ProcessInfo.processInfo.systemUptime,"processingMS":result.processingMS,"mfgMS":fgMS,"workMS":(ready-began)*1000,"generated":generated.count,"captureGuidedFrames":generated.filter{$0.captureGuided}.count,"pairReset":reset,"pairDifference":difference,"warpParityMaxByteDelta":parity,"stages":result.stages])
+      if history.count>120 {history.removeFirst(history.count-120)}
+     }
+     lock.unlock()
+    } catch {
+     lock.lock()
+     if work.3==epoch {state.failed &+= 1;state.error=String(describing:error)}
+     lock.unlock()
+    }
+   }
+  }
+ }
+ public func stop() {lock.lock();stopped=true;epoch &+= 1;guideRing.clear();pending=nil;frame=nil;schedule.clear();lock.unlock();Self.worker.sync {engine=nil;engineConfiguration=nil;interpolator=nil;appleInterpolator=nil}}
+ package func status()->[String:Any] {
+  lock.lock();defer{lock.unlock()}
+  let rows=history.filter{($0["mode"] as? String)==configuration.mode}
+  let recent=Array(rows.suffix(60)),times=recent.compactMap{$0["processingMS"] as? Double}.sorted()
+  let activeSettings=(try? JSONSerialization.jsonObject(with:JSONEncoder().encode(configuration))) ?? [:]
+  let first=recent.first?["completedAt"] as? Double ?? 0,last=recent.last?["completedAt"] as? Double ?? 0
+  var nativeSkipped:UInt64=0
+  if #available(macOS 15.4,*),let native=appleInterpolator?.ready() as? AppleFrameInterpolator {nativeSkipped=native.skippedBusyPairs}
+  let nativeState=appleInterpolator?.status() ?? ("inactive","")
+  var display=nativePresentation
+  if let sampled=display["sampledAtHostSeconds"] as? Double,ProcessInfo.processInfo.systemUptime-sampled>2.5 {display["active"]=false;display["baseShownFPS"]=0;display["generatedShownFPS"]=0;display["uniqueShownFPS"]=0}
+  return ["captureGuides":guideRing.status(),"captureGuided":configuration.captureGuided,"guidedFrames":guidedCount,"nativeFGState":nativeState.0,"nativeFGError":nativeState.1,"nativeFGSkippedPairs":nativeSkipped,"mfgBackend":configuration.frameGenerationBackend,"mfgCompositor":configuration.frameGenerationBackend=="apple" ? "apple-native-flow-single-anchor" : ProcessInfo.processInfo.environment["DLSS_MFG_LEGACY"]=="1" ? "legacy-phase-blend" : "single-trajectory-single-source","nativePreview":display,"settings":activeSettings,"mode":configuration.title,"modeID":configuration.mode,"backend":"NR MLX/Metal FP16 + MPS (NR ANE off); MFG \(configuration.frameGenerationFactor)x \(configuration.frameGenerationBackend=="apple" ? "Apple VT, system-managed hardware" : "MLX/Metal")","submitted":state.submitted,"completed":state.completed,"replaced":state.superseded,"failed":state.failed,"error":state.error,"busy":state.busy,"processingMedianMS":times.isEmpty ? 0 : times[times.count/2],"processedFPS":last>first ? Double(recent.count-1)/(last-first) : 0,"warpParityMaxByteDelta":warpParity,"mfgFlowHeight":configuration.frameGenerationHeight,"mfgFactor":configuration.frameGenerationFactor,"generatedFrames":generatedCount,"mfgFailures":interpolationFailures,"mfgError":interpolationError,"pairResets":pairResets,"playbackQueueDepth":schedule.slots.count,"playbackMaxQueueDepth":schedule.maxDepth,"playbackDebtResets":schedule.debtResets,"playbackUnderruns":schedule.underruns,"playbackClockDelayMS":schedule.clockDelayMS,"expiredBeforeSelection":schedule.expiredBeforeSelection,"selectedFrameAgeMS":schedule.selected.map{(ProcessInfo.processInfo.systemUptime-$0.sourceSeconds)*1000} ?? 0,"outputWidth":frame?.texture.width ?? 0,"outputHeight":frame?.texture.height ?? 0,"stages":frame?.stages ?? [:],"recentFrames":history]
+ }
+}
