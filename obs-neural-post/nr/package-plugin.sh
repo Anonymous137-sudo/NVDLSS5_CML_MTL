@@ -16,10 +16,12 @@ for library in libnvgnx_dlss_mlx libnvgnx_dlssnr librtss libnvidia_nr; do
 done
 cp -c "$project_dir/../MLX-DLSS/.build/release/mlx-swift_Cmlx.bundle/Contents/Resources/default.metallib" "$plugin/Contents/Frameworks/mlx.metallib"
 cp -c "$plugin/Contents/Frameworks/mlx.metallib" "$plugin/Contents/Resources/mlx.metallib"
-cp -cR "$project_dir/build/teacher/NeuralRendering.dlssmodel" "$plugin/Contents/Resources/"
-cp -cR "$project_dir/build/three-mode/NeuralRendering-Small.dlssmodel" "$plugin/Contents/Resources/"
-cp -c "$project_dir/models/rt4ksr-x3.safetensors" "$plugin/Contents/Resources/"
-cp -c "$project_dir/build/quality-first/framegen.safetensors" "$plugin/Contents/Resources/"
+if [[ "${DLSS_BUNDLE_LOCAL_MODELS:-0}" == 1 ]]; then
+  cp -cR "$project_dir/build/teacher/NeuralRendering.dlssmodel" "$plugin/Contents/Resources/"
+  cp -cR "$project_dir/build/three-mode/NeuralRendering-Small.dlssmodel" "$plugin/Contents/Resources/"
+  cp -c "$project_dir/models/rt4ksr-x3.safetensors" "$plugin/Contents/Resources/"
+  cp -c "$project_dir/build/quality-first/framegen.safetensors" "$plugin/Contents/Resources/"
+fi
 cp "$project_dir/../MLX-DLSS/LICENSE" "$plugin/Contents/Resources/MLX-DLSS-LICENSE"
 cp "$project_dir/../MLX-DLSS/NOTICE" "$plugin/Contents/Resources/MLX-DLSS-NOTICE"
 cp "$project_dir/licenses/RT4KSR-LICENSE" "$plugin/Contents/Resources/"
