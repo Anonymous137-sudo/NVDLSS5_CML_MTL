@@ -20,6 +20,10 @@ private func config(_ text:UnsafePointer<CChar>)throws->NRConfiguration {try JSO
  do {Unmanaged<NRBridge>.fromOpaque(handle).takeUnretainedValue().pipeline.update(try config(text));return true}
  catch {fputs("DLSS NR settings: \(error)\n",stderr);return false}
 }
+@_cdecl("nr_reset_input") public func nrResetInput(_ handle:UnsafeMutableRawPointer?) {
+ guard let handle else{return}
+ Unmanaged<NRBridge>.fromOpaque(handle).takeUnretainedValue().pipeline.resetInput()
+}
 @_cdecl("nr_destroy") public func nrDestroy(_ handle:UnsafeMutableRawPointer?) {
  guard let handle else{return};let bridge=Unmanaged<NRBridge>.fromOpaque(handle).takeRetainedValue();bridge.pipeline.stop()
  DispatchQueue.main.async {bridge.window?.close();bridge.window=nil}

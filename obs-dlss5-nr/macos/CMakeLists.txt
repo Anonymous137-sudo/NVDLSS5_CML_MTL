@@ -1,0 +1,18 @@
+cmake_minimum_required(VERSION 3.28)
+project(obs-dlss5-nr VERSION 1.3.0 LANGUAGES C CXX)
+set(CMAKE_OSX_DEPLOYMENT_TARGET 14.0)
+set(CMAKE_CXX_STANDARD 20)
+set(OBS_APP "/Applications/OBS.app" CACHE PATH "OBS application")
+set(OBS_HEADERS "" CACHE PATH "OBS source headers matching the installed application")
+set(NR5_RUNTIME_DIR "${CMAKE_CURRENT_SOURCE_DIR}/../build/macos-runtime" CACHE PATH "Native runtime build output")
+if(NOT EXISTS "${OBS_HEADERS}/libobs/obs.h")
+  message(FATAL_ERROR "Set OBS_HEADERS to the OBS release source matching OBS_APP")
+endif()
+configure_file(../src/plugin-support.c.in plugin-support.c @ONLY)
+file(WRITE "${CMAKE_CURRENT_BINARY_DIR}/obsconfig.h" "#pragma once\n#define OBS_RELEASE_CANDIDATE 0\n#define OBS_BETA 0\n")
+add_library(obs-dlss5-nr MODULE ../src/plugin-main.c ../src/dlss5-nr-filter.cpp "${CMAKE_CURRENT_BINARY_DIR}/plugin-support.c")
+target_include_directories(obs-dlss5-nr PRIVATE ../src "${OBS_HEADERS}/libobs" "${OBS_HEADERS}/../simde-0.8.2" "${CMAKE_CURRENT_BINARY_DIR}")
+target_link_libraries(obs-dlss5-nr PRIVATE "${OBS_APP}/Contents/Frameworks/libobs.framework/libobs" "${NR5_RUNTIME_DIR}/libobs_dlss5_nr.dylib")
+set_target_properties(obs-dlss5-nr PROPERTIES PREFIX "" SUFFIX "" BUNDLE TRUE BUNDLE_EXTENSION plugin
+  MACOSX_BUNDLE_INFO_PLIST "${CMAKE_CURRENT_SOURCE_DIR}/Info.plist.in"
+  BUILD_WITH_INSTALL_RPATH TRUE INSTALL_RPATH "@loader_path/../Frameworks;@executable_path/../Frameworks")

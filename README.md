@@ -1,14 +1,22 @@
 # NVDLSS5_CML_MTL
 
-An experimental Apple Silicon OBS plugin for screen-space neural post-processing of a console HDMI feed. It captures 720p video through AVFoundation, runs neural appearance processing at 480p, and resolves the output to 1080p. The standalone plugin runs in stock OBS. The project also includes earlier Core ML/ANE, Metal and MLX research tools. The current release runs appearance inference on MLX/Metal and uses MPS for scaling.
+Experimental Apple Silicon screen-space neural rendering with Metal, MLX and native capture. The current source includes the obs-dlss5-nr macOS model port, five NR modes, RIFE/MLX/Apple interpolation, bounded asynchronous NR/MFG workers, and HDMI or Mac display capture. A native ProMotion presenter reports fresh base frames, generated frames and display refresh separately.
+
+The current capture path accepts 1080p NV12 SDR. Processing resolution is configurable, including a 2160p maximum; that maximum does not enlarge a 1080p source. Full-resolution Fidelity remains approximately 2–3 base FPS on the tested M4 Pro. Playable full-resolution throughput and temporal-quality acceptance are unresolved.
+
+Direct ANEForge/IOSurface and mixed-precision experiments are in `obs-neural-post/tools/aneforge`. They are explicitly experimental: neither the rejected quantized candidates nor the slower hybrid partitions are enabled in live NR. See that directory's README for measured numerical gates and costs.
+
+Mac display capture is documented in [the capture guide](obs-neural-post/nr/MAC_DISPLAY_CAPTURE.md). This source snapshot retains the optional OBS integration; an OBS-free native host is the next development target.
 
 | Mode | Appearance passes |
 | --- | --- |
 | Fidelity | 71-block → 71-block |
 | Balanced | 31-block → 71-block |
 | Performance | Single 31-block pass |
+| 71 Single | Single 71-block pass |
+| 31 Double | 31-block → 31-block |
 
-The DLSS 5 controls include temporal NR, a configurable HUD region, and mutually exclusive Final and Per-Layer intensity modes. Optional frame generation uses MLX or Apple VideoToolbox, with a cap of 6×. The native preview supports ProMotion and an RTSS-style overlay that separates fresh frames, generated frames, and display refresh.
+The DLSS 5 controls include temporal NR, a configurable HUD region, and mutually exclusive Final and Per-Layer intensity modes. Optional frame generation uses RIFE Metal, MLX or Apple VideoToolbox, with a cap of 6×. The native preview supports ProMotion and an RTSS-style overlay that separates fresh frames, generated frames, and display refresh.
 
 ## Install and configure
 
@@ -66,3 +74,7 @@ The original full-model bundle was exercised on a live PS5 feed in stock OBS 32.
 ## License
 
 Project source is GPL-3.0. MLX-DLSS and its local patches retain Apache-2.0 terms. See [LICENSE](LICENSE), [MLX-DLSS notices](dependencies/NOTICE), and the component notices in the release archive. NVIDIA binaries and extracted checkpoints are outside the GPL project license and the release archive.
+
+## Native port and dependencies
+
+`obs-dlss5-nr/` contains the macOS model-runtime port and upstream notices. `dependencies/mlx-dlss.patch` records the current MLX-DLSS source changes against `dependencies/MLX-DLSS-REVISION`. Model weights and machine-local symlinks are not included. RIFE Metal and ANEForge are external dependencies; the latter is only needed for the experimental probes.

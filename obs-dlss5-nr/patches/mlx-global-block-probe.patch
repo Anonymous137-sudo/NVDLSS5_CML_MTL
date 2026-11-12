@@ -1,0 +1,38 @@
+diff --git a/Sources/DLSSMLX/MLXGlobalBlockProbe.swift b/Sources/DLSSMLX/MLXGlobalBlockProbe.swift
+new file mode 100644
+--- /dev/null
++++ b/Sources/DLSSMLX/MLXGlobalBlockProbe.swift
+@@ -0,0 +1,33 @@
++import MLX
++
++/// Explicit captured-stage diagnostics. No renderer call site selects this API.
++/// Uses the production gate, projected-attention and final residual kernels.
++public enum MLXGlobalBlockProbe {
++  public static func reference(
++    _ input: MLXArray, expansion: MLXArray, branch: MLXArray, ffnCosine: MLXArray,
++    qkv: MLXArray, scale: MLXArray, projection: MLXArray, attentionCosine: MLXArray
++  ) -> MLXArray {
++    precondition(NeuralRenderingGlobalBlock.experimentalLogitCap == 3)
++    return NeuralRenderingTransformerOperations.globalBlock(
++      input.reshaped([1, 20, 32, 1024]), expansionWeight: NeuralRenderingLinearWeight(expansion),
++      feedForwardProjectionWeight: NeuralRenderingLinearWeight(branch), feedForwardCosine: ffnCosine,
++      qkvWeight: qkv, attentionScale: scale, attentionBias: nil,
++      attentionProjectionWeight: projection, attentionCosine: attentionCosine,
++      headCount: 32, logitCap: 3, preciseSoftmax: true,
++      fusedOperations: true, publishOutput: true).reshaped([640, 1024])
++  }
++
++  public static func finish(
++    mid: MLXArray, qkv: MLXArray, scale: MLXArray,
++    projection: MLXArray, attentionCosine: MLXArray
++  ) -> MLXArray {
++    precondition(NeuralRenderingGlobalBlock.experimentalLogitCap == 3)
++    precondition(NeuralRenderingStreamedGlobalAttention.projectedEnabled(tokens: 640))
++    let attended = NeuralRenderingStreamedGlobalAttention.applyProjected(
++      qkv.reshaped([1, 640, 3072]), heads: 32, queryScale: scale * Float(32).squareRoot())
++    let branch = matmul(attended, projection)
++    return NeuralRenderingFusedWindowAttention.cosineResidual(
++      skip: mid.reshaped([1, 640, 1024]), branch: branch,
++      cosine: attentionCosine, publish: true).reshaped([640, 1024])
++  }
++}

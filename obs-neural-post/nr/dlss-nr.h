@@ -7,6 +7,7 @@ void nr_set_metallib(const char *path);
 void *nr_create(const char *json);
 bool nr_update(void *handle,const char *json);
 void nr_destroy(void *handle);
+void nr_reset_input(void *handle);
 void nr_submit(void *handle,void *pixels,uint64_t sequence,double pts);
 void *nr_frame_acquire(void *handle);
 void *nr_frame_pixels(void *frame);

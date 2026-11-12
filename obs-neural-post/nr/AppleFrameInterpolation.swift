@@ -52,8 +52,10 @@ final class AppleFrameInterpolator {
  }
  private func frame(_ p:CVPixelBuffer,_ t:Double)->VTFrameProcessorFrame{VTFrameProcessorFrame(buffer:p,presentationTimeStamp:CMTime(seconds:t,preferredTimescale:90000))!}
  private var historyInput: (CVPixelBuffer, Double)?
- func resetHistory() { historyInput = nil }
- func estimateBackward(_ input: CVPixelBuffer, time: Double) throws -> (Int, Int, [Float])? {
+ private(set) var completedHistoryFlow: NativeFlowPair?
+ func resetHistory() { historyInput = nil; completedHistoryFlow=nil }
+ func estimateBackward(_ input: CVPixelBuffer, time: Double, retainPair:Bool=false) throws -> (Int, Int, [Float])? {
+  completedHistoryFlow=nil
   if let flight, !flight.snapshot().0 { resetHistory(); return nil }
   let current = try convert(try inputTexture(input)).0
   let previous = historyInput
@@ -82,6 +84,7 @@ final class AppleFrameInterpolator {
   var values = [Float]()
   values.reserveCapacity(fw * fh * 2)
   for y in 0..<fh { for x in 0..<(fw * 2) { values.append(Float(data[y * stride + x])) } }
+  if retainPair { completedHistoryFlow=NativeFlowPair(from:oldTime,to:time,forward:forward,backward:backward) }
   return (fw, fh, values)
  }
  private func inputTexture(_ input: CVPixelBuffer) throws -> MTLTexture {
@@ -99,7 +102,7 @@ final class AppleFrameInterpolator {
   let start=ProcessInfo.processInfo.systemUptime
   func empty(_ diff:Double=0)->MultiFrameInterpolator.Result{.init(frames:[],milliseconds:(ProcessInfo.processInfo.systemUptime-start)*1000,cut:true,difference:diff,validationMaxDelta:-1)}
   if let f=flight,!f.snapshot().0{reset();skip();return empty()}
-  let style=try convert(base.texture),raw=guided ? try convert(base.motionGuide?.texture ?? base.texture):style,a=previous,b=Endpoint(frame:base,raw:raw);previous=b
+  let style=try convert(base.texture),raw=try base.motionGuide.map {try convert($0.texture)} ?? style,a=previous,b=Endpoint(frame:base,raw:raw);previous=b
   guard let a else{return empty()}
   let gap=base.sourceSeconds-a.frame.sourceSeconds;guard gap>0,gap<=0.25 else{random=true;return empty()}
   let targets=guided ? CaptureGuideSelection.select(guides,after:a.frame.sourceSeconds,before:base.sourceSeconds,factor:factor):[]
@@ -110,7 +113,16 @@ final class AppleFrameInterpolator {
   for y in stride(from:30,to:1080,by:60){for x in stride(from:30,to:1920,by:60){for c in 0..<3{diff+=Double(abs(Float(ap[y*ar+x*4+c])-Float(bp[y*br+x*4+c])))/Double(18*32*3)}}}
   CVPixelBufferUnlockBaseAddress(raw.0,.readOnly);CVPixelBufferUnlockBaseAddress(a.raw.0,.readOnly)
   if diff>=0.25{random=true;return empty(diff)}
-  let f=try flowBuffer(),r=try flowBuffer(),flow=VTFrameProcessorOpticalFlow(forwardFlow:f.0,backwardFlow:r.0)!
+  let f:(CVPixelBuffer,MTLTexture),r:(CVPixelBuffer,MTLTexture)
+  if base.motionGuide != nil, a.frame.motionGuide != nil, let shared=base.nativeFlow,
+     shared.from==a.frame.sourceSeconds,shared.to==base.sourceSeconds {
+   f=shared.forward;r=shared.backward
+   // A later fallback request must start a fresh VT sequence.
+   random=true
+   base.stages["mfgReusedNativeFlow"]=1
+  } else {
+   f=try flowBuffer();r=try flowBuffer()
+   let flow=VTFrameProcessorOpticalFlow(forwardFlow:f.0,backwardFlow:r.0)!
   if diff<0.0001 {
    for buffer in [f.0,r.0] {CVPixelBufferLockBaseAddress(buffer,[]);memset(CVPixelBufferGetBaseAddress(buffer)!,0,CVPixelBufferGetBytesPerRow(buffer)*CVPixelBufferGetHeight(buffer));CVPixelBufferUnlockBaseAddress(buffer,[])}
    random=true
@@ -120,10 +132,26 @@ final class AppleFrameInterpolator {
   guard request.done.wait(timeout:.now()+0.08) == .success else{reset();skip();return empty()}
   if let error=request.snapshot().1{throw error};random=false
   }
+  }
   let cb=queue.makeCommandBuffer()!;var result:[ProcessedFrame]=[]
   for (i,phase) in phases.enumerated(){
    let out=try surface(half:false),e=cb.makeComputeCommandEncoder()!;var flags:[UInt32]=[phase.bitPattern,guided ? 1:0]
    e.setComputePipelineState(pack);e.setTexture(style.1,index:0);e.setTexture(out.1,index:1);e.setTexture(raw.1,index:2);e.setTexture(guided ? targets[i].texture:base.texture,index:3);e.setTexture(r.1,index:4);e.setTexture(f.1,index:5)
+    let proxy=base.appearanceProxy
+    let earlier=a.frame.appearanceProxy
+    var gain=earlier != nil ? (proxy?.gain ?? -1) : -1
+    var hud=proxy?.hud ?? SIMD4<Float>(repeating:0)
+    e.setTexture(proxy?.source.1 ?? base.texture,index:6)
+    e.setTexture(proxy?.correction ?? base.texture,index:7)
+    e.setTexture(earlier?.source.1 ?? a.frame.texture,index:8)
+    e.setTexture(earlier?.correction ?? a.frame.texture,index:9)
+    e.setTexture(a.frame.motionGuide?.texture ?? a.frame.texture,index:10)
+    e.setTexture(base.motionGuide?.texture ?? base.texture,index:11)
+    e.setTexture(a.frame.texture,index:12)
+    e.setBytes(&gain,length:MemoryLayout<Float>.stride,index:1)
+    e.setBytes(&hud,length:MemoryLayout<SIMD4<Float>>.stride,index:2)
+    var colorControls=proxy?.colorControls ?? SIMD3<Float>(repeating:1)
+    e.setBytes(&colorControls,length:MemoryLayout<SIMD3<Float>>.stride,index:3)
    flags.withUnsafeMutableBytes{e.setBytes($0.baseAddress!,length:$0.count,index:0)}
    e.dispatchThreads(MTLSize(width:1920,height:1080,depth:1),threadsPerThreadgroup:MTLSize(width:16,height:8,depth:1));e.endEncoding()
    let frame=ProcessedFrame(out.0,out.1,base.sequence,guided ? targets[i].seconds:a.frame.sourceSeconds+gap*Double(phase),0,0);frame.generated=true;frame.captureGuided=guided;frame.phase=Double(phase);frame.pairStart=a.frame.sequence;frame.pairEnd=base.sequence;result.append(frame)
@@ -152,27 +180,65 @@ final class AppleFrameInterpolator {
   if(p.x>=b.get_width()||p.y>=b.get_height())return;b.write(half4(a.sample(s,(float2(p)+.5f)/float2(b.get_width(),b.get_height()))),p);
  }
  struct Params{float time;uint guided;};
- kernel void anchor_pack(texture2d<half> style [[texture(0)]],texture2d<float,access::write> out [[texture(1)]],texture2d<half> raw [[texture(2)]],texture2d<float> actual [[texture(3)]],texture2d<half> backward [[texture(4)]],texture2d<half> forward [[texture(5)]],constant Params &q [[buffer(0)]],uint2 p [[thread_position_in_grid]]){
+ kernel void anchor_pack(texture2d<half> style [[texture(0)]],texture2d<float,access::write> out [[texture(1)]],texture2d<half> raw [[texture(2)]],texture2d<float> actual [[texture(3)]],texture2d<half> backward [[texture(4)]],texture2d<half> forward [[texture(5)]],constant Params &q [[buffer(0)]],texture2d<float> proxyRaw [[texture(6)]],texture2d<float> proxyStyled [[texture(7)]],texture2d<float> earlierRaw [[texture(8)]],texture2d<float> earlierStyled [[texture(9)]],texture2d<float> earlierGuide [[texture(10)]],texture2d<float> rawBGuide [[texture(11)]],constant float &gain [[buffer(1)]],constant float4 &hud [[buffer(2)]],constant float3 &colorControls [[buffer(3)]],texture2d<float> earlierStyle [[texture(12)]],uint2 p [[thread_position_in_grid]]){
   if(p.x>=out.get_width()||p.y>=out.get_height())return;
   float2 size=float2(out.get_width(),out.get_height()),grid=float2(backward.get_width(),backward.get_height()),here=(float2(p)+.5f)/size,uv=here;
   // Calibrated native flow values are displacement in flow-grid pixels.
   for(uint k=0;k<4;k++)uv=here-(1.f-q.time)*float2(backward.sample(s,uv).xy)/grid;
   float3 styled=float3(style.sample(s,uv).rgb),rgb=styled;
   if(q.guided){
-   float3 guide=actual.sample(s,here).rgb,reference=float3(raw.sample(s,uv).rgb);float error=0;
-   for(int y=-1;y<=1;y++)for(int x=-1;x<=1;x++){float2 d=float2(x,y)*2.f/size;float3 e=float3(raw.sample(s,uv+d).rgb)-actual.sample(s,here+d).rgb;error+=dot(e,e)/9.f;}
+   float3 guide=actual.sample(s,here).rgb,reference=float3(raw.sample(s,uv).rgb);
+
    float2 back=float2(backward.sample(s,uv).xy),oldUV=uv+back/grid,cycle=back+float2(forward.sample(s,oldUV).xy),inverse=(uv+(1.f-q.time)*back/grid-here)*size;
    float2 dx=float2(backward.sample(s,uv+float2(1,0)/grid).xy)-back,dy=float2(backward.sample(s,uv+float2(0,1)/grid).xy)-back,jx=float2(1,0)+(1.f-q.time)*dx,jy=float2(0,1)+(1.f-q.time)*dy;
    float det=jx.x*jy.y-jx.y*jy.x;
-   float confidence=exp(-error/.0025f)*exp(-dot(cycle,cycle))*exp(-dot(inverse,inverse)/4.f)*smoothstep(.1f,.4f,det)*(1.f-smoothstep(3.f,8.f,det));
+   float confidence=exp(-dot(cycle,cycle))*exp(-dot(inverse,inverse)/4.f)*smoothstep(.1f,.4f,det)*(1.f-smoothstep(3.f,8.f,det));
    if(any(uv<0.f)||any(uv>1.f)||any(oldUV<0.f)||any(oldUV>1.f))confidence=0;
-   float3 rawMean=reference*2.f,styledMean=styled*2.f;
+   if (gain >= 0.f) {
+    bool protect=all(here >= hud.xy) && all(here < hud.zw);
+    float2 ua=here;
+    for(uint k=0;k<4;k++)ua=here-q.time*float2(forward.sample(s,ua).xy)/grid;
+    float2 forwardAtA=float2(forward.sample(s,ua).xy);
+    float2 reachedB=ua+forwardAtA/grid;
+    float2 cycleA=forwardAtA+float2(backward.sample(s,reachedB).xy);
+    float2 inverseA=(ua+q.time*forwardAtA/grid-here)*size;
+    float3 matchA=register_guide(earlierGuide,actual,ua,here,size);
+    float3 matchB=register_guide(rawBGuide,actual,uv,here,size);
+    float trustA=matchA.z
+                 *exp(-dot(cycleA,cycleA))*exp(-dot(inverseA,inverseA)/4.f);
+    if(any(reachedB<0.f)||any(reachedB>1.f)) trustA=0.f;
+    confidence*=matchB.z;
+    CorrectionSample before=sample_correction(earlierStyled,earlierRaw,matchA.xy,guide);
+    CorrectionSample after=sample_correction(proxyStyled,proxyRaw,matchB.xy,guide);
+    rgb=protect ? guide : compose_transported_detail(guide,before,after,q.time,trustA,confidence,gain,colorControls);
+   } else {
+    float error=0.f;
+   for(int y=-1;y<=1;y++)for(int x=-1;x<=1;x++){float2 d=float2(x,y)*2.f/size;float3 e=float3(raw.sample(s,uv+d).rgb)-actual.sample(s,here+d).rgb;error+=dot(e,e)/9.f;}
+    confidence*=exp(-error/.0025f);
+    float3 rawMean=reference*2.f,styledMean=styled*2.f;
    for(int axis=0;axis<2;axis++) {
     float2 offset=(axis==0 ? float2(6,0):float2(0,6))/size;
     rawMean+=float3(raw.sample(s,uv+offset).rgb)+float3(raw.sample(s,uv-offset).rgb);
     styledMean+=float3(style.sample(s,uv+offset).rgb)+float3(style.sample(s,uv-offset).rgb);
    }
    rgb=apply_guided_appearance(guide,rawMean/6.f,styledMean/6.f,confidence);
+   }
+  } else {
+   float2 ua=here;
+   for(uint k=0;k<4;k++)ua=here-q.time*float2(forward.sample(s,ua).xy)/grid;
+   float2 f=float2(forward.sample(s,ua).xy),b=float2(backward.sample(s,uv).xy);
+   float2 reachedB=ua+f/grid,reachedA=uv+b/grid;
+   float2 cycleA=f+float2(backward.sample(s,reachedB).xy);
+   float2 cycleB=b+float2(forward.sample(s,reachedA).xy);
+   float2 inverseA=(ua+q.time*f/grid-here)*size;
+   float2 inverseB=(uv+(1.f-q.time)*b/grid-here)*size;
+   bool validA=all(ua>=0.f)&&all(ua<=1.f)&&all(reachedB>=0.f)&&all(reachedB<=1.f);
+   bool validB=all(uv>=0.f)&&all(uv<=1.f)&&all(reachedA>=0.f)&&all(reachedA<=1.f);
+   float trustA=validA ? exp(-dot(cycleA,cycleA)-dot(inverseA,inverseA)/4.f) : 0.f;
+   float trustB=validB ? exp(-dot(cycleB,cycleB)-dot(inverseB,inverseB)/4.f) : 0.f;
+   if (max(trustA,trustB)<.15f)
+    rgb=q.time<.5f ? earlierStyle.sample(s,here).rgb : float3(style.sample(s,here).rgb);
+   else if ((1.f-q.time)*trustA>q.time*trustB) rgb=earlierStyle.sample(s,ua).rgb;
   }
   out.write(float4(round(clamp(rgb,0.f,1.f)*255.f)/255.f,1.f),p);
  }

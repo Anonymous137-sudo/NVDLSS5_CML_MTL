@@ -19,3 +19,8 @@ __pycache__/
 /MLX-DLSS/
 /obs-studio/
 /obs-neural-post/models/
+
+# Local dependency links and caches
+MLX-DLSS
+.deps
+models

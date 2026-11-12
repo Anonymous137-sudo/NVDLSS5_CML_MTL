@@ -124,7 +124,7 @@ static NSView *line(void){NSView *v=[NSView new];v.wantsLayer=YES;v.layer.backgr
  self.controlsTab.selectedStyle=!self.tools;self.controlsTab.needsDisplay=YES;self.toolsTab.selectedStyle=self.tools;self.toolsTab.needsDisplay=YES;
  NSTextField *title=label(self.tools ? @"DLSS 5 LIVE TOOLS":@"DLSS 5 SWAPPER CONTROLS",21,NSFontWeightHeavy);self.badge=label(@"CONNECTING",12,NSFontWeightHeavy);self.badge.textColor=lime();self.badge.alignment=NSTextAlignmentCenter;self.badge.wantsLayer=YES;self.badge.layer.borderColor=lime().CGColor;self.badge.layer.borderWidth=1.5;self.badge.layer.cornerRadius=7;[self.badge.widthAnchor constraintEqualToConstant:120].active=YES;height(self.badge,28);NSView *space=[NSView new];[self add:[self horizontal:@[title,space,self.badge]]];
  if(self.tools){[self buildTools];}else{
- [self check:@"DLSS ON" key:@"enabled" hint:@"OBS ·live NR pipeline"];
+ [self check:@"NEURAL RENDERING" key:@"enabled" hint:@"Off: native HDMI. Frame generation can still run."];
  [self check:@"ON-SCREEN STATUS" key:@"onScreenStatus" hint:@"Show DLSS ON/OFF over the game"];
  [self section:@"GLOBAL CONTROLS"];
  [self setting:@"Structure Intensity" key:@"structure" minimum:0 maximum:2 value:1 supported:YES help:@"Recovered NR local-structure conditioning input."];
@@ -140,14 +140,15 @@ static NSView *line(void){NSView *v=[NSView new];v.wantsLayer=YES;v.layer.backgr
  [self setting:@"Final Intensity" key:@"intensity" minimum:0 maximum:2 value:1 supported:YES help:@"Blends or amplifies the finished result against the source once."];
  [self setting:@"Per-Layer Intensity" key:@"layerIntensity" minimum:0 maximum:2 value:1 supported:YES help:@"Scales the current prediction in each NR pass. In two-pass modes the next model receives the adjusted result."];
  [self setting:@"Local Tone Intensity" key:@"tone" minimum:0 maximum:2 value:1 supported:YES help:@"Linked to Tone Intensity: this backend exposes one recovered tone-conditioning input."];
+ [self add:line()];[self section:@"OKLAB COLOUR CORRECTION"];
  [self setting:@"SDR Diffuse White" key:@"diffuseWhite" minimum:80 maximum:400 value:80 supported:YES help:@"SDR white reference, relative to 80 nits. Output remains SDR."];
- [self setting:@"Luminance Transfer" key:@"hdrStrength" minimum:0 maximum:2 value:1 supported:YES help:@"Strength of NR luminance change in screen space."];
- [self setting:@"Color Transfer" key:@"colorStrength" minimum:0 maximum:2 value:1 supported:YES help:@"Strength of NR chroma change in screen space."];
+ [self setting:@"OKLab Lightness" key:@"hdrStrength" minimum:0 maximum:2 value:1 supported:YES help:@"Scale the neural correction along the OKLab lightness axis. 1.0 is neutral."];
+ [self setting:@"OKLab Chroma" key:@"colorStrength" minimum:0 maximum:2 value:1 supported:YES help:@"Scale the neural correction along the OKLab chroma axes. 1.0 is neutral."];
  [self check:@"PROTECT HUD RECTANGLE" key:@"uiCorrection" hint:@"Set the rectangle in original OBS source properties"];
  [self check:@"TEMPORAL NR" key:@"temporalNR" hint:@"Use motion estimated from the HDMI image"];
  [self setting:@"Motion Scale X Multiplier" key:@"motionScaleX" minimum:-2 maximum:2 value:1 supported:YES help:@"Horizontal scale for estimated screen-space NR motion."];
  [self setting:@"Motion Scale Y Multiplier" key:@"motionScaleY" minimum:-2 maximum:2 value:1 supported:YES help:@"Vertical scale for estimated screen-space NR motion."];
- [self add:line()];NSTextField *note=label(@"Live NR settings. A/B/C select NR style, not separate AI models. Click a number to type. Tone controls share the same recovered input. Temporal NR uses estimated screen-space motion. Live tools keeps the original OBS controls available.",11,NSFontWeightMedium);note.maximumNumberOfLines=0;note.lineBreakMode=NSLineBreakByWordWrapping;note.textColor=[NSColor colorWithWhite:.8 alpha:1];[self add:note];
+ [self add:line()];NSTextField *note=label(@"Native obs-dlss5-nr model pipeline. A/B/C select style. Final intensity applies after reconstruction; Per-Layer intensity applies inside each pass. Grey controls belong to the retired display compositor. Temporal NR uses macOS optical flow and the model history inputs.",11,NSFontWeightMedium);note.maximumNumberOfLines=0;note.lineBreakMode=NSLineBreakByWordWrapping;note.textColor=[NSColor colorWithWhite:.8 alpha:1];[self add:note];
  }
  [self refreshControls];[self.scroll.contentView scrollToPoint:NSZeroPoint];[self.scroll reflectScrolledClipView:self.scroll.contentView];
 }
@@ -156,6 +157,18 @@ static NSView *line(void){NSView *v=[NSView new];v.wantsLayer=YES;v.layer.backgr
  for(NSUInteger i=0;i<labels.count;i++){[popup addItemWithTitle:labels[i]];popup.lastItem.representedObject=values[i];}popup.target=self;popup.action=@selector(popupChanged:);[self registerControl:popup key:key];[self add:[self horizontal:@[name,popup]]];
 }
 - (void)buildTools {
+ [self section:@"CAPTURE INPUT"];
+ [self popup:@"Input source" key:@"captureInput" labels:@[@"PS5 / external HDMI",@"Mac display"] values:@[@"hdmi",@"display"]];
+ NSMutableArray *screenNames=[NSMutableArray arrayWithObject:@"Automatic ·built-in / primary"],*screenIDs=[NSMutableArray arrayWithObject:@0];
+ for(NSScreen *screen in NSScreen.screens){[screenNames addObject:screen.localizedName];[screenIDs addObject:screen.deviceDescription[@"NSScreenNumber"]];}
+ [self popup:@"Mac display" key:@"captureDisplay" labels:screenNames values:screenIDs];
+ __weak __typeof__(self) weakScreen=self;
+ DLSSButton *screenAccess=[[DLSSButton alloc] initWithTitle:@"Screen recording permission / reconnect display"];height(screenAccess,44);
+ screenAccess.clicked=^(DLSSButton *button){(void)button;CGRequestScreenCaptureAccess();DLSSControlsController *s=weakScreen;
+  if(s.source){obs_data_t *settings=obs_source_get_settings(s.source);obs_source_update(s.source,settings);obs_data_release(settings);}};
+ [self add:screenAccess];
+ NSTextField *screenHint=label(@"Mac display input uses 1080p SDR at up to 60 FPS and preserves the display's aspect ratio. OBS windows are excluded from capture to prevent preview feedback.",12,NSFontWeightMedium);
+ screenHint.maximumNumberOfLines=0;screenHint.lineBreakMode=NSLineBreakByWordWrapping;[self add:screenHint];
  NSMutableArray *deviceNames=[NSMutableArray arrayWithObject:@"Select HDMI capture device"],*deviceIDs=[NSMutableArray arrayWithObject:@""];
  AVCaptureDeviceDiscoverySession *discovery=[AVCaptureDeviceDiscoverySession discoverySessionWithDeviceTypes:@[AVCaptureDeviceTypeExternal] mediaType:AVMediaTypeVideo position:AVCaptureDevicePositionUnspecified];
  for(AVCaptureDevice *device in discovery.devices){[deviceNames addObject:device.localizedName];[deviceIDs addObject:device.uniqueID];}
@@ -165,14 +178,14 @@ static NSView *line(void){NSView *v=[NSView new];v.wantsLayer=YES;v.layer.backgr
  authorize.clicked=^(DLSSButton *button){(void)button;DLSSControlsController *s=weakCamera;if(!s.source)return;obs_source_t *lease=obs_source_get_ref(s.source);
   [AVCaptureDevice requestAccessForMediaType:AVMediaTypeVideo completionHandler:^(BOOL granted){(void)granted;dispatch_async(dispatch_get_main_queue(),^{obs_data_t *s=obs_source_get_settings(lease);obs_source_update(lease,s);obs_data_release(s);obs_source_release(lease);});}];};[self add:authorize];
  [self section:@"NEURAL RENDERING"];
- [self popup:@"DLSS mode" key:@"mode" labels:@[@"DLSS Fidelity ·71 →71",@"DLSS Balanced ·31 →71",@"DLSS Performance ·31"] values:@[@"71x2-480",@"31then71-480",@"31-480"]];
+ [self popup:@"Native NR resolution" key:@"nativeProcessingHeight" labels:@[@"Source",@"480p",@"720p",@"1080p",@"1440p",@"2160p"] values:@[@0,@480,@720,@1080,@1440,@2160]];
+ [self popup:@"DLSS mode" key:@"mode" labels:@[@"DLSS Fidelity ·71 →71",@"DLSS Balanced ·31 →71",@"DLSS Performance ·31",@"DLSS 71 Single ·71",@"DLSS 31 Double ·31 →31"] values:@[@"71x2-480",@"31then71-480",@"31-480",@"71-480",@"31x2-480"]];
  [self check:@"LEARNED UPSCALING" key:@"upscaling" hint:@"Existing reconstruction branch"];
  [self add:line()];[self section:@"MULTI-FRAME GENERATION"];
- [self popup:@"Interpolation engine" key:@"frameGenerationBackend" labels:@[@"MLX AI frame generation",@"Apple native frame generation"] values:@[@"mlx",@"apple"]];
+ [self popup:@"Interpolation engine" key:@"frameGenerationBackend" labels:@[@"MLX AI frame generation",@"Apple native frame generation",@"RIFE Metal v4.25"] values:@[@"mlx",@"apple",@"rife"]];
  [self popup:@"Maximum factor" key:@"frameGenerationFactor" labels:@[@"Off",@"2×",@"3×",@"4×",@"5×",@"6×"] values:@[@1,@2,@3,@4,@5,@6]];
- [self check:@"CAPTURE-GUIDED MOTION" key:@"captureGuided" hint:@"Use actual HDMI intermediate geometry"];
  [self popup:@"MLX motion detail" key:@"frameGenerationHeight" labels:@[@"Fast ·360p",@"Detailed ·540p",@"High ·720p"] values:@[@360,@540,@720]];
- NSTextField *hint=label(@"Capture-guided mode reconstructs appearance on real intermediate HDMI frames. The maximum factor is a cap; it does not invent duplicate capture timestamps or guarantee a display rate. Apple motion processing uses full1080p.",12,NSFontWeightMedium);hint.maximumNumberOfLines=0;hint.lineBreakMode=NSLineBreakByWordWrapping;[self add:hint];
+ NSTextField *hint=label(@"Frame generation uses completed source frames. The maximum factor caps intermediates per pair; NR processing time and presentation pacing determine the displayed rate.",12,NSFontWeightMedium);hint.maximumNumberOfLines=0;hint.lineBreakMode=NSLineBreakByWordWrapping;[self add:hint];
  __weak __typeof__(self) weak=self;
  DLSSButton *preview=[[DLSSButton alloc] initWithTitle:@"Open native ProMotion preview"];height(preview,48);preview.clicked=^(DLSSButton *b){(void)b;DLSSControlsController *s=weak;if(s.source){obs_properties_t *p=obs_source_properties(s.source);obs_property_t *button=obs_properties_get(p,"preview");if(button)obs_property_button_clicked(button,s.source);obs_properties_destroy(p);}};[self add:preview];
  DLSSButton *advanced=[[DLSSButton alloc] initWithTitle:@"Original OBS source properties"];height(advanced,48);advanced.clicked=^(DLSSButton *b){(void)b;DLSSControlsController *s=weak;if(s.source)obs_frontend_open_source_properties(s.source);};[self add:advanced];
@@ -193,6 +206,7 @@ static NSView *line(void){NSView *v=[NSView new];v.wantsLayer=YES;v.layer.backgr
  }}
  for(NSUInteger i=0;i<self.styleButtons.count;i++){self.styleButtons[i].selectedStyle=obs_data_get_int(s,"style")== (long long)i;self.styleButtons[i].needsDisplay=YES;}
  for(NSControl *c in self.controls[@"skinStructure"])c.enabled=obs_data_get_bool(s,"automaticMask");
+ for(NSString *key in @[@"upscaling",@"diffuseWhite",@"hdrStrength",@"colorStrength",@"motionScaleX",@"motionScaleY",@"noiseFrame",@"uiCorrection",@"uiX",@"uiY",@"uiWidth",@"uiHeight"])for(NSControl *c in self.controls[key]){c.enabled=NO;c.toolTip=@"Legacy compositor control. The upstream NR model pipeline owns display reconstruction."; }
  for(NSControl *c in self.controls[@"frameGenerationHeight"])c.enabled=!strcmp(obs_data_get_string(s,"frameGenerationBackend"),"mlx");
  BOOL layerMode=!strcmp(obs_data_get_string(s,"intensityMode"),"layer");
  for(NSControl *c in self.controls[@"intensity"])c.enabled=!layerMode;

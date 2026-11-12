@@ -1,0 +1,22 @@
+diff --git a/Sources/DLSSMLX/MLXVideoFrameIntensity.swift b/Sources/DLSSMLX/MLXVideoFrameIntensity.swift
+new file mode 100644
+--- /dev/null
++++ b/Sources/DLSSMLX/MLXVideoFrameIntensity.swift
+@@ -0,0 +1,17 @@
++import Foundation
++import MLX
++
++extension MLXVideoFrame {
++  /// Apply the final display intensity after temporal history has been stored.
++  /// Cascaded model inputs and their histories retain their original values.
++  public func applyingIntensity(over source: MLXVideoFrame, strength: Float) throws -> MLXVideoFrame
++  {
++    guard width == source.width, height == source.height, strength.isFinite,
++      (0...2).contains(strength)
++    else {
++      throw MLXMediaError("Final NR intensity requires equal extents and strength 0...2")
++    }
++    if strength == 1 { return self }
++    return MLXVideoFrame(clip(source.array + (array - source.array) * strength, min: 0, max: 1))
++  }
++}

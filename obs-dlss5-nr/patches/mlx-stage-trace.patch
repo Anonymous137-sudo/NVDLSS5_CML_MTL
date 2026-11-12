@@ -1,0 +1,303 @@
+diff --git a/Sources/DLSSMLX/MLXNeuralRenderer.swift b/Sources/DLSSMLX/MLXNeuralRenderer.swift
+index ed5b3c3..7be43b6 100644
+--- a/Sources/DLSSMLX/MLXNeuralRenderer.swift
++++ b/Sources/DLSSMLX/MLXNeuralRenderer.swift
+@@ -174,22 +174,22 @@ public actor MLXNeuralRenderer: NeuralRenderBackend {
+ 
+   public func reset(_ request: NeuralRenderResetRequest) async {}
+ 
+-  func statelessOutputArray(_ input: MLXArray) throws -> MLXArray {
++  func statelessOutputArray(_ input: MLXArray, traceContext: NeuralRenderFrameContext? = nil, diagnosticLabel: String? = nil) throws -> MLXArray {
+     try model.validateInputShape(input.shape)
+     return Device.withDefaultDevice(.gpu) {
+-      executeModel(input)
++      executeModel(input, traceContext: traceContext, diagnosticLabel: diagnosticLabel)
+     }
+   }
+ 
+-  func statelessOutputTransfer(_ input: MLXArrayTransfer) throws -> MLXArrayTransfer {
+-    MLXArrayTransfer(array: try statelessOutputArray(input.array))
++  func statelessOutputTransfer(_ input: MLXArrayTransfer, traceContext: NeuralRenderFrameContext? = nil, diagnosticLabel: String? = nil) throws -> MLXArrayTransfer {
++    MLXArrayTransfer(array: try statelessOutputArray(input.array, traceContext: traceContext, diagnosticLabel: diagnosticLabel))
+   }
+ 
+-  private func executeModel(_ input: MLXArray) -> MLXArray {
++  private func executeModel(_ input: MLXArray, traceContext: NeuralRenderFrameContext? = nil, diagnosticLabel: String? = nil) -> MLXArray {
+     if let compiledModel {
+       compiledModel(input)
+     } else {
+-      model.statelessOutput(input)
++      model.statelessOutput(input, traceContext: traceContext, diagnosticLabel: diagnosticLabel)
+     }
+   }
+ 
+@@ -220,12 +220,12 @@ private enum LoadedMLXModel {
+   case pixelAffine(PixelAffineModel)
+   case neuralRenderingTransformer(NeuralRenderingTransformerModel)
+ 
+-  func statelessOutput(_ input: MLXArray) -> MLXArray {
++  func statelessOutput(_ input: MLXArray, traceContext: NeuralRenderFrameContext? = nil, diagnosticLabel: String? = nil) -> MLXArray {
+     switch self {
+     case .pixelAffine(let model):
+       model(input)
+     case .neuralRenderingTransformer(let model):
+-      model(input)
++      model(input, traceContext: traceContext, diagnosticLabel: diagnosticLabel)
+     }
+   }
+ 
+diff --git a/Sources/DLSSMLX/MLXNeuralRenderingDeviceTemporalBackend.swift b/Sources/DLSSMLX/MLXNeuralRenderingDeviceTemporalBackend.swift
+index f9bf150..9bd9df7 100644
+--- a/Sources/DLSSMLX/MLXNeuralRenderingDeviceTemporalBackend.swift
++++ b/Sources/DLSSMLX/MLXNeuralRenderingDeviceTemporalBackend.swift
+@@ -135,7 +135,7 @@ public actor MLXNeuralRenderingDeviceTemporalBackend: NeuralRenderBackend {
+     context: NeuralRenderFrameContext, processingScale: Float = 1, temporal: Bool = true,
+     outputOptions: MLXVideoOutputOptions? = nil,
+     featureControls: NeuralRenderingFeatureControls? = nil, intensity: Float? = nil,
+-    evaluated: Bool = true
++    evaluated: Bool = true, diagnosticLabel: String? = nil
+   ) async throws -> MLXVideoFrame {
+     guard !nativeFrameInFlight else { throw MLXMediaError("Submit native NR frames sequentially") }
+     nativeFrameInFlight = true
+@@ -171,7 +171,7 @@ public actor MLXNeuralRenderingDeviceTemporalBackend: NeuralRenderBackend {
+     let result = try await renderArrays(context: frameContext, color: color, motion: vectors,
+       depth: nativeGuides!.depth, controlMask: nil, historyConfidence: confidence,
+       descriptors: descriptors, evaluateOutput: false,
+-      featureControls: featureControls, intensity: intensity)
++      featureControls: featureControls, intensity: intensity, diagnosticLabel: diagnosticLabel)
+     if let stages = retainedStages {
+       retainedFrame = RetainedFrame(stages: stages, source: frame.array, processingScale: processingScale,
+         intensity: intensity ?? controlMaskIntensity)
+@@ -275,7 +275,7 @@ public actor MLXNeuralRenderingDeviceTemporalBackend: NeuralRenderBackend {
+     depth depthArray: MLXArray, controlMask controlMaskArray: MLXArray?,
+     historyConfidence confidenceArray: MLXArray?, descriptors: [TensorDescriptor],
+     evaluateOutput: Bool, featureControls: NeuralRenderingFeatureControls? = nil,
+-    intensity: Float? = nil
++    intensity: Float? = nil, diagnosticLabel: String? = nil
+   ) async throws -> (output: MLXArray, nanoseconds: UInt64) {
+     let featureControls = featureControls ?? self.featureControls
+     let intensity = intensity ?? controlMaskIntensity
+@@ -406,7 +406,7 @@ public actor MLXNeuralRenderingDeviceTemporalBackend: NeuralRenderBackend {
+         array: networkFeatures.asType(computePrecision.mlxDataType)
+       )
+       // The postprocessor reads the logical corner of the network-extent head output.
+-      let headOutput = try await head.statelessOutputTransfer(preparedFeatures).array
++      let headOutput = try await head.statelessOutputTransfer(preparedFeatures, traceContext: context, diagnosticLabel: diagnosticLabel).array
+       let hadHistory = history != nil
+       let output = postprocessor(
+         head: headOutput,
+diff --git a/Sources/DLSSMLX/NeuralRenderingTransformerOperations.swift b/Sources/DLSSMLX/NeuralRenderingTransformerOperations.swift
+--- a/Sources/DLSSMLX/NeuralRenderingTransformerOperations.swift
++++ b/Sources/DLSSMLX/NeuralRenderingTransformerOperations.swift
+@@ -1,3 +1,4 @@
++import DLSSCore
+ import Foundation
+ import MLX
+ 
+@@ -51,6 +52,7 @@
+ }
+ 
+ struct NeuralRenderingWindowBlock {
++  private let diagnosticBlockIndex: Int
+   private let body: (MLXArray, Bool?) -> MLXArray
+   /// Multi-head blocks fold the final residual and publication into one kernel.
+   private let fusesOutputResidual: Bool
+@@ -70,6 +72,7 @@
+     compileBlock: Bool = false,
+     topology: NeuralRenderingTopology = .ht
+   ) throws {
++    self.diagnosticBlockIndex = blockIndex
+     let prefix = "block\(blockIndex).layer0"
+     let windowOrigin = topology.windowOrigin(for: blockIndex)
+     let feedForwardCosine = try Self.require(
+@@ -205,16 +208,25 @@
+   }
+ 
+   func callAsFunction(_ input: MLXArray) -> MLXArray {
++    let windowTrace = diagnosticBlockIndex == 1 ? MLXNeuralStageTrace.active : nil
++    if windowTrace != nil { eval(input) }
++    let windowStart = windowTrace != nil ? ProcessInfo.processInfo.systemUptime : 0
++    let output: MLXArray
+     if let fusedBody, input.dtype == .float16, input.shape[0] == 1 {
+-      return fusedBody(input, publishesOutput)
+-    }
+-    if fusesOutputResidual, input.dtype == .float16 {
+-      return body(input, publishesOutput)
+-    }
+-    let output = body(input, nil)
+-    return publishesOutput
+-      ? NeuralRenderingTransformerOperations.e4m3RoundTrip(output)
+-      : output
++      output = fusedBody(input, publishesOutput)
++    } else if fusesOutputResidual, input.dtype == .float16 {
++      output = body(input, publishesOutput)
++    } else {
++      let raw = body(input, nil)
++      output = publishesOutput ? NeuralRenderingTransformerOperations.e4m3RoundTrip(raw) : raw
++    }
++    if let windowTrace {
++      eval(output)
++      windowTrace.captureWindow(blockIndex: diagnosticBlockIndex,
++        input: input, output: output, origin: windowOrigin,
++        wallMS: (ProcessInfo.processInfo.systemUptime-windowStart)*1000)
++    }
++    return output
+   }
+ 
+   /// The single-head kernel with its neighbouring glue folded in
+@@ -717,14 +729,19 @@
+     )
+   }
+ 
+-  func callAsFunction(_ input: MLXArray) -> NeuralRenderingTrunkOutput {
++  func callAsFunction(_ input: MLXArray, trace: MLXNeuralStageTrace? = nil) -> NeuralRenderingTrunkOutput {
+     let encoded = encoder(input)
++    trace?.record("encoder", arrays: [encoded.fullResolutionSkip, encoded.latent] + encoded.skips)
+     let split = splitEncoder(encoded.latent)
++    trace?.record("split-encoder", arrays: [split.skip, split.latent])
++    trace?.dump("global-input", split.latent)
++    let latent = globalStage(split.latent)
++    trace?.record("global-attention", arrays: [latent])
+     return NeuralRenderingTrunkOutput(
+       fullResolutionSkip: encoded.fullResolutionSkip,
+       skips: encoded.skips,
+       splitSkip: split.skip,
+-      latent: globalStage(split.latent)
++      latent: latent
+     )
+   }
+ }
+@@ -1132,11 +1149,21 @@
+     )
+   }
+ 
+-  func callAsFunction(_ input: MLXArray) -> MLXArray {
+-    let encoded = trunk(input)
++  func callAsFunction(_ input: MLXArray, traceContext: NeuralRenderFrameContext? = nil,
++                      diagnosticLabel: String? = nil) -> MLXArray {
++    let trace = MLXNeuralStageTrace.begin(input: input, topology: topology.description,
++                                        context: traceContext, label: diagnosticLabel)
++    return MLXNeuralStageTrace.$active.withValue(trace) {
++    let encoded = trunk(input, trace: trace)
+     let decoderStart = decoderInput(encoded.latent, skip: encoded.splitSkip)
++    trace?.record("decoder-bridge", arrays: [decoderStart])
+     let decoded = decoder(decoderStart, skips: encoded.skips)
+-    return post(decoded, skip: encoded.fullResolutionSkip)
++    trace?.record("decoder", arrays: [decoded])
++    let output = post(decoded, skip: encoded.fullResolutionSkip)
++    trace?.record("post", arrays: [output])
++    trace?.finish()
++    return output
++    }
+   }
+ }
+ 
+diff --git a/Sources/DLSSMLX/MLXNeuralStageTrace.swift b/Sources/DLSSMLX/MLXNeuralStageTrace.swift
+new file mode 100644
+--- /dev/null
++++ b/Sources/DLSSMLX/MLXNeuralStageTrace.swift
+@@ -0,0 +1,104 @@
++import DLSSCore
++import Foundation
++import MLX
++
++/// Opt-in, bounded stage materialization for live captured-feature diagnostics.
++/// Disabled calls leave the ordinary lazy graph unchanged. Stage walls include
++/// forced synchronization and dump work; they are not acceptance FPS/GPU counters.
++final class MLXNeuralStageTrace: @unchecked Sendable {
++  @TaskLocal static var active: MLXNeuralStageTrace?
++  private static let lock = NSLock()
++  nonisolated(unsafe) private static var admitted = 0
++  nonisolated(unsafe) private static var seen = 0
++  private let directory: URL
++  private let label: String?
++  private let context: NeuralRenderFrameContext?
++  private var stages: [[String: Any]] = []
++  private var last = ProcessInfo.processInfo.systemUptime
++
++  static func begin(input: MLXArray, topology: String,
++                    context: NeuralRenderFrameContext?, label: String?) -> MLXNeuralStageTrace? {
++    let environment = ProcessInfo.processInfo.environment
++    guard let root = environment["DLSS_NR_STAGE_TRACE"], !root.isEmpty else { return nil }
++    let limit = min(8, max(1, Int(environment["DLSS_NR_STAGE_TRACE_FRAMES"] ?? "4") ?? 4))
++    let skip = max(0, Int(environment["DLSS_NR_STAGE_TRACE_SKIP"] ?? "6") ?? 6)
++    lock.lock()
++    seen += 1
++    guard seen > skip, admitted < limit else { lock.unlock(); return nil }
++    admitted += 1
++    let number = admitted
++    lock.unlock()
++    do {
++      let directory = URL(fileURLWithPath: root).appendingPathComponent("head-\(number)-\(UUID().uuidString)")
++      try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
++      let trace = MLXNeuralStageTrace(directory: directory, label: label, context: context)
++      eval(input)
++      trace.record("feature-materialize", arrays: [input])
++      try JSONSerialization.data(withJSONObject: ["topology": topology, "inputShape": input.shape,
++        "label": label ?? "unlabelled", "scope": "Opt-in synchronized stages from live inference; not normal frame timing"])
++        .write(to: directory.appendingPathComponent("input.json"), options: .atomic)
++      return trace
++    } catch {
++      NSLog("NR stage trace creation failed: %@", String(describing: error))
++      return nil
++    }
++  }
++
++  private init(directory: URL, label: String?, context: NeuralRenderFrameContext?) {
++    self.directory = directory; self.label = label; self.context = context
++  }
++
++  func record(_ name: String, arrays: [MLXArray]) {
++    arrays.forEach { eval($0) }
++    let now = ProcessInfo.processInfo.systemUptime
++    stages.append(["name": name, "wallMS": (now-last)*1000, "shapes": arrays.map(\.shape)])
++    last = now
++  }
++
++  func dump(_ name: String, _ value: MLXArray, layout: String = "NHWC") {
++    do {
++      let packed = contiguous(value.asType(.float16))
++      eval(packed)
++      try packed.asData(access: .copy).data.write(to: directory.appendingPathComponent(name + ".f16"))
++      try JSONSerialization.data(withJSONObject: ["shape": packed.shape, "layout": layout, "dtype": "float16"])
++        .write(to: directory.appendingPathComponent(name + ".json"))
++    } catch { NSLog("NR stage dump failed: %@", String(describing: error)) }
++    // Explicit dump overhead is kept out of the next stage's wall time.
++    last = ProcessInfo.processInfo.systemUptime
++  }
++
++  func captureWindow(blockIndex: Int, input: MLXArray, output: MLXArray,
++                     origin: NeuralRenderingWindowOrigin, wallMS: Double) {
++    guard blockIndex == 1, input.shape.count == 4, input.shape[0] == 1,
++      input.shape[3] == 32, input.shape[1] >= 88, input.shape[2] >= 104 else { return }
++    var sources: [MLXArray] = [], results: [MLXArray] = [], locations: [[Int]] = []
++    for row in 0..<2 { for column in 0..<4 {
++      let y = 64 + origin.y + row * 8, x = 64 + origin.x + column * 8
++      sources.append(input[0..., y..<(y+8), x..<(x+8), 0...].reshaped([1,64,32]))
++      results.append(output[0..., y..<(y+8), x..<(x+8), 0...].reshaped([1,64,32]))
++      locations.append([y,x])
++    }}
++    let source = concatenated(sources, axis: 0).reshaped([1,8,64,32])
++    let result = concatenated(results, axis: 0).reshaped([1,8,64,32])
++    eval(source, result)
++    let beforeIO = ProcessInfo.processInfo.systemUptime, priorClock = last
++    dump("window1-input", source, layout: "NWTC")
++    dump("window1-output", result, layout: "NWTC")
++    do {
++      try JSONSerialization.data(withJSONObject: ["block": blockIndex, "sourceShape": input.shape,
++        "originsYX": locations, "windowOriginYX": [origin.y,origin.x], "publication": "E4M3", "fullBlockWallMS": wallMS])
++        .write(to: directory.appendingPathComponent("window1.json"))
++    } catch { NSLog("NR window trace metadata failed: %@", String(describing: error)) }
++    last = priorClock + ProcessInfo.processInfo.systemUptime - beforeIO
++  }
++
++  func finish() {
++    do {
++      var report: [String: Any] = ["stages": stages, "label": label ?? "unlabelled",
++        "scope": "Synchronized diagnostic stages; excludes final composition and presentation"]
++      if let context { report["streamID"] = context.streamID; report["frameIndex"] = context.frameIndex }
++      try JSONSerialization.data(withJSONObject: report, options: [.prettyPrinted, .sortedKeys])
++        .write(to: directory.appendingPathComponent("stages.json"), options: .atomic)
++    } catch { NSLog("NR stage report failed: %@", String(describing: error)) }
++  }
++}

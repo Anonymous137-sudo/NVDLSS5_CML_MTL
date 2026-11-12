@@ -34,19 +34,21 @@ package struct NRConfiguration: Codable, Equatable {
  var temporalNR:Bool?
  var motionScaleX:Float?
  var motionScaleY:Float?
+ var nativeProcessingHeight:Int?
  var captureGuided = false
  var frameGenerationBackend = "mlx"
  var frameGenerationFactor = 1
  var frameGenerationHeight = 360
  var frameGenerationPath = ""
+ var rifeModelPath:String?
  var automatic:NeuralRenderingAutomaticMaskConfiguration? {
   automaticMask ? NeuralRenderingAutomaticMaskConfiguration(skinStructureStrength:skinStructure,automaticMaskStructureStrength:maskStructure) : nil
  }
  var title:String {
-  mode == "71x2-480" ? "DLSS Fidelity" : mode == "31-480" ? "DLSS Performance" : "DLSS Balanced"
+  mode == "71x2-480" ? "DLSS Fidelity" : mode == "71-480" ? "DLSS 71 Single" : mode == "31x2-480" ? "DLSS 31 Double" : mode == "31-480" ? "DLSS Performance" : "DLSS Balanced"
  }
  package func checked() throws -> NRConfiguration {
-  guard ["mlx","apple"].contains(frameGenerationBackend),(1...6).contains(frameGenerationFactor), [360,540,720].contains(frameGenerationHeight), ["71x2-480","31then71-480","31-480"].contains(mode),
+  guard [0,480,720,1080,1440,2160].contains(nativeProcessingHeight ?? 1080), ["mlx","apple","rife"].contains(frameGenerationBackend),(1...6).contains(frameGenerationFactor), [360,540,720].contains(frameGenerationHeight), ["71x2-480","31then71-480","31-480","71-480","31x2-480"].contains(mode),
    (0...128).contains(style),(0...65535).contains(noiseFrame),
    (80...400).contains(diffuseWhite ?? 80),
    (0...2).contains(hdrStrength ?? 1),(0...2).contains(colorStrength ?? 1),
@@ -57,6 +59,8 @@ package struct NRConfiguration: Codable, Equatable {
    maskStructure.isFinite,(-1...2).contains(maskStructure) else {
     throw NSError(domain:"DLSS NR",code:1,userInfo:[NSLocalizedDescriptionKey:"Invalid mode or model control range"])
    }
-  return self
+  var normalized=self
+  normalized.captureGuided=false
+  return normalized
  }
 }

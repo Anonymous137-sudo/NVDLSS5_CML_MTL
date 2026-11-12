@@ -2,27 +2,32 @@
 // GPL-2.0-or-later, matching OBS Studio. Native runtime; no Python host.
 #import <AVFoundation/AVFoundation.h>
 #import <CoreVideo/CoreVideo.h>
+#import <VideoToolbox/VideoToolbox.h>
 #import <CoreText/CoreText.h>
 #import <IOSurface/IOSurface.h>
 #import <obs-module.h>
 #import "dlss-nr.h"
 #import "DLSSControls.h"
+#import "MacDisplayCapture.h"
+#import "dlss5-nr-filter.h"
 #import <obs-frontend-api.h>
 
 OBS_DECLARE_MODULE()
-MODULE_EXPORT const char *obs_module_description(void) { return "DLSS 5 NR: Fidelity, Balanced and Performance; 480p appearance to 1080p"; }
+OBS_MODULE_USE_DEFAULT_LOCALE("obs-dlss-nr","en-US")
+MODULE_EXPORT const char *obs_module_description(void) { return "DLSS 5 NR: obs-dlss5-nr native model pipeline, HDMI / Mac display capture and frame generation"; }
 
 static NSString *resource_path(NSString *key) {
     NSString *binary=@(obs_get_module_binary_path(obs_current_module()));
     NSString *root=[[[binary stringByDeletingLastPathComponent] stringByDeletingLastPathComponent] stringByAppendingPathComponent:@"Resources"];
-    NSString *file=[@{@"model71":@"NeuralRendering.dlssmodel",@"model31":@"NeuralRendering-Small.dlssmodel",@"srPath":@"rt4ksr-x3.safetensors",@"frameGenerationPath":@"framegen.safetensors"} objectForKey:key];
+    NSString *file=[@{@"model71":@"NeuralRendering.dlssmodel",@"model31":@"NeuralRendering-Small.dlssmodel",@"srPath":@"rt4ksr-x3.safetensors",@"frameGenerationPath":@"framegen.safetensors",@"rifeModelPath":@"rife-v4.25.rmw"} objectForKey:key];
     return [root stringByAppendingPathComponent:file];
 }
 static NSString *configuration_json(obs_data_t *settings) {
     NSMutableDictionary *d=[NSMutableDictionary dictionary];
+    d[@"rifeModelPath"]=resource_path(@"rifeModelPath");
     for(NSString *key in @[@"mode",@"intensityMode",@"model71",@"model31",@"srPath",@"frameGenerationPath",@"frameGenerationBackend"])d[key]=@(obs_data_get_string(settings,key.UTF8String));
-    for(NSString *key in @[@"enabled",@"upscaling",@"automaticMask",@"captureGuided",@"temporalNR",@"uiCorrection"])d[key]=@(obs_data_get_bool(settings,key.UTF8String));
-    for(NSString *key in @[@"style",@"noiseFrame",@"frameGenerationFactor",@"frameGenerationHeight"])d[key]=@(obs_data_get_int(settings,key.UTF8String));
+    for(NSString *key in @[@"enabled",@"upscaling",@"automaticMask",@"captureGuided",@"temporalNR",@"uiCorrection"])d[key]=obs_data_get_bool(settings,key.UTF8String) ? @YES : @NO;
+    for(NSString *key in @[@"style",@"noiseFrame",@"frameGenerationFactor",@"frameGenerationHeight",@"nativeProcessingHeight"])d[key]=@(obs_data_get_int(settings,key.UTF8String));
     for(NSString *key in @[@"diffuseWhite",@"hdrStrength",@"colorStrength",@"uiX",@"uiY",@"uiWidth",@"uiHeight",@"motionScaleX",@"motionScaleY",@"intensity",@"layerIntensity",@"tone",@"structure",@"skinStructure",@"maskStructure"])d[key]=@(obs_data_get_double(settings,key.UTF8String));
     return [[NSString alloc] initWithData:[NSJSONSerialization dataWithJSONObject:d options:0 error:nil] encoding:NSUTF8StringEncoding];
 }
@@ -32,6 +37,9 @@ static void capture_instance(void *data,calldata_t *params);
 
 @interface NeuralCapture : NSObject <AVCaptureVideoDataOutputSampleBufferDelegate>
 @property(strong) AVCaptureSession *session;
+@property(atomic, strong) MacDisplayCapture *displayCapture;
+@property(atomic, copy) NSString *captureInput;
+@property uint32_t requestedDisplay;
 @property(strong) dispatch_queue_t captureQueue;
 @property(strong) dispatch_queue_t controlQueue;
 @property(strong) dispatch_queue_t diagnosticsQueue;
@@ -48,12 +56,17 @@ static void capture_instance(void *data,calldata_t *params);
 @property(copy) NSString *modelPath;
 @property(copy) NSString *appearancePath;
 @property(copy) NSString *anePath;
+@property(atomic, copy) NSDictionary *captureColor;
+@property(copy) NSDictionary *effectiveColor;
+@property VTPixelTransferSessionRef colorTransfer;
+@property CVPixelBufferPoolRef colorPool;
 @property(copy) NSString *captureError;
 @property uint64_t renderedSequence,renderedUnique,captureStarts,captureDrops,renderedBase,renderedGenerated,renderedGuided,renderedRepeats;
 @property double renderStart,lastStatusTime;
 @property obs_source_t *owner;
 - (void)configure:(obs_data_t *)settings;
 - (void)shutdown;
+- (void)consumeSample:(CMSampleBufferRef)sample clock:(CMClockRef)clock;
 @end
 
 @implementation NeuralCapture
@@ -66,11 +79,43 @@ static void capture_instance(void *data,calldata_t *params);
     }
     return self;
 }
+- (void)releaseColorTransfer {
+    if (_colorTransfer) CFRelease(_colorTransfer);
+    if (_colorPool) CFRelease(_colorPool);
+    _colorTransfer = NULL;
+    _colorPool = NULL;
+    self.captureColor = nil;
+    self.effectiveColor = nil;
+}
+- (BOOL)prepareColorTransfer {
+    OSStatus result = VTPixelTransferSessionCreate(NULL, &_colorTransfer);
+    if (result == noErr)
+        result = VTSessionSetProperty(_colorTransfer, kVTPixelTransferPropertyKey_DestinationColorPrimaries,
+                                      kCVImageBufferColorPrimaries_ITU_R_709_2);
+    if (result == noErr)
+        result = VTSessionSetProperty(_colorTransfer, kVTPixelTransferPropertyKey_DestinationTransferFunction,
+                                      kCVImageBufferTransferFunction_sRGB);
+    if (result == noErr) {
+        NSDictionary *attributes = @{
+            (id)kCVPixelBufferPixelFormatTypeKey: @(kCVPixelFormatType_32BGRA),
+            (id)kCVPixelBufferWidthKey: @1920, (id)kCVPixelBufferHeightKey: @1080,
+            (id)kCVPixelBufferIOSurfacePropertiesKey: @{},
+            (id)kCVPixelBufferMetalCompatibilityKey: @YES
+        };
+        result = CVPixelBufferPoolCreate(NULL, NULL, (__bridge CFDictionaryRef)attributes, &_colorPool);
+    }
+    if (result == noErr) return YES;
+    [self releaseColorTransfer];
+    self.captureError = [NSString stringWithFormat:@"Cannot initialize SDR color conversion (%d)", (int)result];
+    return NO;
+}
 - (void)configure:(obs_data_t *)settings {
     NSString *deviceID=@(obs_data_get_string(settings,"device"));
     NSString *json=configuration_json(settings);
-    bool sameDevice=[_deviceID isEqual:deviceID];
-    _deviceID=deviceID;
+    NSString *input=[@(obs_data_get_string(settings,"captureInput")) isEqual:@"display"] ? @"display":@"hdmi";
+    uint32_t display=(uint32_t)obs_data_get_int(settings,"captureDisplay");
+    bool sameDevice=[_deviceID isEqual:deviceID]&&[_captureInput isEqual:input]&&_requestedDisplay==display;
+    _deviceID=deviceID;_captureInput=input;_requestedDisplay=display;
     dispatch_sync(_controlQueue, ^{
         self.captureError=@"";
         @synchronized(self) {
@@ -101,6 +146,22 @@ static void capture_instance(void *data,calldata_t *params);
             }
         }
         self.statusEnabled=show;
+        BOOL displayMode=[input isEqual:@"display"];
+        if(sameDevice&&((displayMode&&(self.displayCapture.running||self.displayCapture.starting))||(!displayMode&&self.session.isRunning)))return;
+        [self.displayCapture stop];self.displayCapture=nil;
+        [self.session stopRunning];self.session=nil;
+        dispatch_sync(self.captureQueue,^{[self releaseColorTransfer];});
+        nr_reset_input(self.engine);
+        if(displayMode) {
+            if(![self prepareColorTransfer])return;
+            __weak NeuralCapture *weak=self;
+            self.displayCapture=[[MacDisplayCapture alloc] initWithControlQueue:self.controlQueue captureQueue:self.captureQueue
+                frame:^(CMSampleBufferRef sample){[weak consumeSample:sample clock:NULL];}
+                error:^(NSString *message){weak.captureError=message;}];
+            self.captureStarts++;
+            [self.displayCapture startDisplay:display];
+            return;
+        }
         AVAuthorizationStatus authorization=[AVCaptureDevice authorizationStatusForMediaType:AVMediaTypeVideo];
         if(authorization==AVAuthorizationStatusNotDetermined) {
             self.captureError=@"Allow camera access in the macOS dialog to use HDMI capture.";
@@ -118,9 +179,6 @@ static void capture_instance(void *data,calldata_t *params);
             return;
         }
         if(authorization!=AVAuthorizationStatusAuthorized){self.captureError=@"Camera access is disabled in macOS Privacy & Security → Camera.";return;}
-        if(sameDevice && self.session.isRunning) return;
-        [self.session stopRunning];self.session=nil;
-        dispatch_sync(self.captureQueue,^{});
         if(!deviceID.length) return;
         AVCaptureDevice *device=[AVCaptureDevice deviceWithUniqueID:deviceID];
         if(!device) {
@@ -135,31 +193,29 @@ static void capture_instance(void *data,calldata_t *params);
         [session beginConfiguration];
         if (![session canAddInput:input]) { self.captureError=@"Cannot add capture input"; [session commitConfiguration]; return; }
         [session addInput:input];
-        if ([session canSetSessionPreset:AVCaptureSessionPreset1280x720]) session.sessionPreset=AVCaptureSessionPreset1280x720;
+        if ([session canSetSessionPreset:AVCaptureSessionPreset1920x1080]) session.sessionPreset=AVCaptureSessionPreset1920x1080;
         AVCaptureDeviceFormat *chosen=nil;
-        AVFrameRateRange *chosenRange=nil;
+        CMTime duration=kCMTimeInvalid;
+        const CMTime targetDuration=CMTimeMake(1,60);
         for (AVCaptureDeviceFormat *format in device.formats) {
             CMVideoDimensions d=CMVideoFormatDescriptionGetDimensions(format.formatDescription);
-            if(d.width!=1280||d.height!=720) continue;
+            if(d.width!=1920||d.height!=1080) continue;
             for(AVFrameRateRange *range in format.videoSupportedFrameRateRanges) {
-                if(range.maxFrameRate>=59.9 && range.minFrameRate<=60.01) {
-                    chosen=format; chosenRange=range; break;
+                if(CMTimeCompare(range.maxFrameDuration,targetDuration)<0) continue;
+                CMTime candidate=CMTimeMaximum(range.minFrameDuration,targetDuration);
+                if(!chosen || CMTimeCompare(candidate,duration)<0) {
+                    chosen=format; duration=candidate;
                 }
             }
-            if(chosen) break;
         }
-        if(!chosen) { self.captureError=@"Device has no 720p59.94/60 mode"; [session commitConfiguration]; return; }
+        if(!chosen) { self.captureError=@"Device has no supported 1080p capture mode"; [session commitConfiguration]; return; }
         AVCaptureVideoDataOutput *output=[AVCaptureVideoDataOutput new];
         output.alwaysDiscardsLateVideoFrames=YES;
-        output.videoSettings=@{(id)kCVPixelBufferPixelFormatTypeKey:@(kCVPixelFormatType_32BGRA),
-                              (id)kCVPixelBufferMetalCompatibilityKey:@YES,
-                              (id)kCVPixelBufferWidthKey:@1280,(id)kCVPixelBufferHeightKey:@720};
         [output setSampleBufferDelegate:self queue:self.captureQueue];
         if(![session canAddOutput:output]) { self.captureError=@"Cannot add video output"; [session commitConfiguration]; return; }
         [session addOutput:output];
         // On macOS the output connection has its own cadence. Device format alone
         // left this USB card delivering 1080p20 in the real PS5 capture test.
-        CMTime duration=chosenRange.minFrameDuration;
         AVCaptureConnection *connection=[output connectionWithMediaType:AVMediaTypeVideo];
         if(connection.supportsVideoMinFrameDuration) connection.videoMinFrameDuration=duration;
         if(connection.supportsVideoMaxFrameDuration) connection.videoMaxFrameDuration=duration;
@@ -167,6 +223,19 @@ static void capture_instance(void *data,calldata_t *params);
         device.activeFormat=chosen;
         device.activeVideoMinFrameDuration=duration; device.activeVideoMaxFrameDuration=duration;
         [device unlockForConfiguration];
+        NSArray<NSNumber *> *formats = output.availableVideoCVPixelFormatTypes;
+        NSNumber *format = @(kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange);
+        if (![formats containsObject:format]) format = @(kCVPixelFormatType_420YpCbCr8BiPlanarFullRange);
+        if (![formats containsObject:format]) {
+            self.captureError = @"Capture device offers no 1080p NV12 output";
+            [session commitConfiguration];
+            return;
+        }
+        if (![self prepareColorTransfer]) { [session commitConfiguration]; return; }
+        output.videoSettings = @{(id)kCVPixelBufferPixelFormatTypeKey: format,
+                                 (id)kCVPixelBufferMetalCompatibilityKey: @YES,
+                                 (id)kCVPixelBufferWidthKey: @1920, (id)kCVPixelBufferHeightKey: @1080};
+
         [session commitConfiguration];
         self.session=session; self.captureStarts++; [session startRunning];
         if(!session.isRunning)self.captureError=@"Capture session failed to start. Check camera permission and the device connection.";
@@ -177,26 +246,78 @@ static void capture_instance(void *data,calldata_t *params);
 }
 - (void)captureOutput:(AVCaptureOutput *)output didOutputSampleBuffer:(CMSampleBufferRef)sample fromConnection:(AVCaptureConnection *)connection {
     (void)output; (void)connection;
+    [self consumeSample:sample clock:self.session.synchronizationClock];
+}
+- (void)consumeSample:(CMSampleBufferRef)sample clock:(CMClockRef)clock {
     CVPixelBufferRef pixels=CMSampleBufferGetImageBuffer(sample);
     if(!pixels) return;
-    if(CVPixelBufferGetWidth(pixels)!=1280 || CVPixelBufferGetHeight(pixels)!=720 ||
-       CVPixelBufferGetPixelFormatType(pixels)!=kCVPixelFormatType_32BGRA) {
-        self.captureError=@"Capture negotiated outside the required 720p BGRA contract";
+    OSType format = CVPixelBufferGetPixelFormatType(pixels);
+    if(CVPixelBufferGetWidth(pixels)!=1920 || CVPixelBufferGetHeight(pixels)!=1080 ||
+       (format != kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange &&
+        format != kCVPixelFormatType_420YpCbCr8BiPlanarFullRange)) {
+        self.captureError=@"Capture negotiated outside the required 1080p NV12 contract";
         return;
     }
     CMTime pts=CMSampleBufferGetPresentationTimeStamp(sample);
-    CMClockRef clock=self.session.synchronizationClock;
     if(clock && clock!=CMClockGetHostTimeClock()) pts=CMSyncConvertTime(pts,clock,CMClockGetHostTimeClock());
     if(!CMTIME_IS_NUMERIC(pts)) return;
-    nr_submit(_engine,(void *)pixels,++_sequence,CMTimeGetSeconds(pts));
+    CFStringRef keys[] = {kCVImageBufferYCbCrMatrixKey, kCVImageBufferColorPrimariesKey,
+                          kCVImageBufferTransferFunctionKey};
+    NSString *names[] = {@"matrix", @"primaries", @"transfer"};
+    NSString *defaults[] = {(__bridge NSString *)kCVImageBufferYCbCrMatrix_ITU_R_709_2,
+                            (__bridge NSString *)kCVImageBufferColorPrimaries_ITU_R_709_2,
+                            (__bridge NSString *)kCVImageBufferTransferFunction_ITU_R_709_2};
+    CMFormatDescriptionRef description = CMSampleBufferGetFormatDescription(sample);
+    NSMutableDictionary *declared = [NSMutableDictionary dictionary];
+    NSMutableDictionary *effective = [NSMutableDictionary dictionary];
+    BOOL needsAttachment[3] = {NO, NO, NO};
+    for (NSUInteger i = 0; i < 3; i++) {
+        id tag = CFBridgingRelease(CVBufferCopyAttachment(pixels, keys[i], NULL));
+        needsAttachment[i] = tag == nil;
+        if (!tag && description)
+            tag = (__bridge id)CMFormatDescriptionGetExtension(description, keys[i]);
+        declared[names[i]] = tag ?: @"untagged";
+        effective[names[i]] = tag ?: self.effectiveColor[names[i]] ?: defaults[i];
+    }
+    self.effectiveColor = effective;
+    NSDictionary *color = @{
+        @"range": format == kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange ? @"video" : @"full",
+        @"declared": declared,
+        @"effective": effective
+    };
+    if (![self.captureColor isEqualToDictionary:color]) {
+        blog(LOG_INFO, "[DLSS NR] 1080p NV12 input %s", color.description.UTF8String);
+        self.captureColor = color;
+    }
+    CVPixelBufferRef rgb = NULL;
+    NSDictionary *limit = @{(id)kCVPixelBufferPoolAllocationThresholdKey: @6};
+    OSStatus result = CVPixelBufferPoolCreatePixelBufferWithAuxAttributes(NULL, _colorPool,
+        (__bridge CFDictionaryRef)limit, &rgb);
+    if (result == kCVReturnWouldExceedAllocationThreshold) { self.captureDrops++; return; }
+    if (result == noErr) {
+        for (NSUInteger i = 0; i < 3; i++)
+            if (needsAttachment[i])
+                CVBufferSetAttachment(pixels, keys[i], (__bridge CFTypeRef)effective[names[i]], kCVAttachmentMode_ShouldPropagate);
+        result = VTPixelTransferSessionTransferImage(_colorTransfer, pixels, rgb);
+        for (NSUInteger i = 0; i < 3; i++)
+            if (needsAttachment[i]) CVBufferRemoveAttachment(pixels, keys[i]);
+    }
+    if (result == noErr) {
+        nr_submit(_engine, (void *)rgb, ++_sequence, CMTimeGetSeconds(pts));
+    } else {
+        self.captureError = [NSString stringWithFormat:@"NV12 color conversion failed (%d)", (int)result];
+    }
+    if (rgb) CFRelease(rgb);
 }
 - (void)captureOutput:(AVCaptureOutput *)output didDropSampleBuffer:(CMSampleBufferRef)sample fromConnection:(AVCaptureConnection *)connection {
     (void)output;(void)sample;(void)connection;self.captureDrops++;
 }
 - (void)shutdown {
     dispatch_sync(_controlQueue, ^{
+        [self.displayCapture stop];self.displayCapture=nil;
         [self.session stopRunning]; self.session=nil;
         dispatch_sync(self.captureQueue, ^{});
+        [self releaseColorTransfer];
         @synchronized(self) { nr_destroy(self.engine); self.engine=NULL; }
     });
     if(_texture) { obs_enter_graphics(); gs_texture_destroy(_texture); _texture=NULL; obs_leave_graphics(); }
@@ -219,13 +340,19 @@ static NSDictionary *runtime_status(NeuralCapture *capture) {
     status[@"obsSelectedBase"]=@(capture.renderedBase);status[@"obsSelectedGenerated"]=@(capture.renderedGenerated);status[@"obsRepeatedDraws"]=@(capture.renderedRepeats);
     status[@"statusOverlayEnabled"]=@(capture.statusEnabled);status[@"statusOverlayAvailable"]=@(capture.statusTexture!=NULL);
     status[@"applicationBundleID"]=NSBundle.mainBundle.bundleIdentifier ?: @"";
-    status[@"captureRunning"]=@(capture.session.isRunning);status[@"captureAuthorization"]=@([AVCaptureDevice authorizationStatusForMediaType:AVMediaTypeVideo]);status[@"engineAvailable"]=@(capture.engine!=NULL);
+    status[@"captureInput"]=capture.captureInput ?: @"hdmi";
+    status[@"captureDisplayID"]=@(capture.displayCapture.displayID);
+    status[@"screenCaptureAuthorized"]=@(CGPreflightScreenCaptureAccess());
+    status[@"captureRunning"]=@(capture.session.isRunning||capture.displayCapture.running);status[@"captureAuthorization"]=@([AVCaptureDevice authorizationStatusForMediaType:AVMediaTypeVideo]);status[@"engineAvailable"]=@(capture.engine!=NULL);
     status[@"captureStarts"]=@(capture.captureStarts);status[@"captureDrops"]=@(capture.captureDrops);
+    status[@"captureColor"]=capture.captureColor ?: @{};
     status[@"captureError"]=capture.captureError ?: @"";
     return status;
 }
-static const char *source_name(void *unused) { (void)unused; return "DLSS 5 NR · PS5 HDMI"; }
+static const char *source_name(void *unused) { (void)unused; return "DLSS 5 NR · HDMI / Mac display"; }
 static void source_defaults(obs_data_t *settings) {
+    obs_data_set_default_string(settings,"captureInput","hdmi");
+    obs_data_set_default_int(settings,"captureDisplay",0);
     obs_data_set_default_string(settings,"mode","31then71-480");
     obs_data_set_default_string(settings,"preset","standard");
     obs_data_set_default_bool(settings,"enabled",true);
@@ -248,6 +375,7 @@ static void source_defaults(obs_data_t *settings) {
     obs_data_set_default_string(settings,"frameGenerationBackend","mlx");
     obs_data_set_default_int(settings,"frameGenerationFactor",1);
     obs_data_set_default_int(settings,"frameGenerationHeight",360);
+    obs_data_set_default_int(settings,"nativeProcessingHeight",1080);
     obs_data_set_default_double(settings,"diffuseWhite",80);
     obs_data_set_default_double(settings,"uiX",4.9);
     obs_data_set_default_double(settings,"uiY",79);
@@ -374,9 +502,31 @@ static bool intensity_mode_changed(obs_properties_t *props,obs_property_t *prope
     obs_property_set_enabled(obs_properties_get(props,"layerIntensity"),layer);
     return true;
 }
+static bool display_permission_clicked(obs_properties_t *props,obs_property_t *property,void *data) {
+    (void)props;(void)property;
+    NeuralCapture *capture=(__bridge NeuralCapture *)data;
+    if(!capture.owner)return false;
+    obs_source_t *lease=obs_source_get_ref(capture.owner);
+    dispatch_async(dispatch_get_main_queue(),^{
+        CGRequestScreenCaptureAccess();
+        obs_data_t *settings=obs_source_get_settings(lease);obs_source_update(lease,settings);
+        obs_data_release(settings);obs_source_release(lease);
+    });
+    return false;
+}
 static obs_properties_t *source_properties(void *data) {
     obs_properties_t *p=obs_properties_create();
-    obs_property_t *devices=obs_properties_add_list(p,"device","HDMI capture device ·720p60",OBS_COMBO_TYPE_LIST,OBS_COMBO_FORMAT_STRING);
+    obs_property_t *input=obs_properties_add_list(p,"captureInput","Input source",OBS_COMBO_TYPE_LIST,OBS_COMBO_FORMAT_STRING);
+    obs_property_list_add_string(input,"PS5 / external HDMI","hdmi");
+    obs_property_list_add_string(input,"Mac display · ScreenCaptureKit","display");
+    obs_property_t *display=obs_properties_add_list(p,"captureDisplay","Mac display ·1080p SDR",OBS_COMBO_TYPE_LIST,OBS_COMBO_FORMAT_INT);
+    obs_property_list_add_int(display,"Automatic ·built-in / primary",0);
+    for(NSScreen *screen in NSScreen.screens) {
+        NSNumber *number=screen.deviceDescription[@"NSScreenNumber"];
+        obs_property_list_add_int(display,screen.localizedName.UTF8String,number.unsignedIntValue);
+    }
+    obs_properties_add_button2(p,"displayPermission","Screen recording permission / reconnect display",display_permission_clicked,data);
+    obs_property_t *devices=obs_properties_add_list(p,"device","HDMI capture device ·1080p",OBS_COMBO_TYPE_LIST,OBS_COMBO_FORMAT_STRING);
     obs_property_list_add_string(devices,"Select capture device","");
     AVCaptureDeviceDiscoverySession *discovery=[AVCaptureDeviceDiscoverySession discoverySessionWithDeviceTypes:@[AVCaptureDeviceTypeExternal] mediaType:AVMediaTypeVideo position:AVCaptureDevicePositionUnspecified];
     for(AVCaptureDevice *device in discovery.devices)obs_property_list_add_string(devices,device.localizedName.UTF8String,device.uniqueID.UTF8String);
@@ -386,6 +536,8 @@ static obs_properties_t *source_properties(void *data) {
     obs_property_list_add_string(m,"DLSS Fidelity ·71 →71", "71x2-480");
     obs_property_list_add_string(m,"DLSS Balanced ·31 →71", "31then71-480");
     obs_property_list_add_string(m,"DLSS Performance ·31 single", "31-480");
+    obs_property_list_add_string(m,"DLSS 71 Single ·71", "71-480");
+    obs_property_list_add_string(m,"DLSS 31 Double ·31 →31", "31x2-480");
     obs_properties_add_bool(nr,"upscaling","Enable learned upscaling (off = spatial resize)");
     obs_property_t *preset=obs_properties_add_list(nr,"preset","NR Preset",OBS_COMBO_TYPE_LIST,OBS_COMBO_FORMAT_STRING);
     obs_property_list_add_string(preset,"Default / Standard","standard");obs_property_list_add_string(preset,"Natural","natural");obs_property_list_add_string(preset,"Cinematic","cinematic");obs_property_list_add_string(preset,"Neutral","neutral");obs_property_list_add_string(preset,"Custom","custom");
@@ -408,22 +560,29 @@ static obs_properties_t *source_properties(void *data) {
     obs_properties_add_bool(guides,"temporalNR","Screen-space temporal NR · experimental");
     obs_properties_add_float_slider(guides,"motionScaleX","Screen-space motion scale X",-2,2,.01);
     obs_properties_add_float_slider(guides,"motionScaleY","Screen-space motion scale Y",-2,2,.01);
-    obs_properties_add_text(guides,"guide_info","720p SDR HDMI →480p appearance →1080p output. RGB-only; engine depth/motion are unavailable.",OBS_TEXT_INFO);
+    obs_properties_add_text(guides,"guide_info","1080p SDR source → native NR pipeline. The processing maximum controls model input sizing. Engine depth/motion are unavailable.",OBS_TEXT_INFO);
     obs_properties_add_bool(guides,"uiCorrection","Protect a screen-space HUD rectangle");
     obs_properties_add_float(guides,"uiX","HUD X (%)",0,100,.1);
     obs_properties_add_float(guides,"uiY","HUD Y (%)",0,100,.1);
     obs_properties_add_float(guides,"uiWidth","HUD width (%)",0,100,.1);
     obs_properties_add_float(guides,"uiHeight","HUD height (%)",0,100,.1);
     obs_properties_add_float(guides,"diffuseWhite","SDR diffuse white reference (nits)",80,400,1);
-    obs_properties_add_float(guides,"hdrStrength","SDR luminance transfer strength",0,2,.01);
-    obs_properties_add_float(guides,"colorStrength","SDR color transfer strength",0,2,.01);
-    obs_properties_add_text(guides,"depthConvention","Screen-space motion uses HDMI RGB. No depth input is used.",OBS_TEXT_INFO);
+    obs_properties_add_float(guides,"hdrStrength","OKLab lightness correction",0,2,.01);
+    obs_properties_add_float(guides,"colorStrength","OKLab chroma correction",0,2,.01);
+    obs_properties_add_text(guides,"depthConvention","Screen-space motion uses captured images. No engine depth input is available.",OBS_TEXT_INFO);
     obs_properties_add_group(p,"guides","Color transfer and guide availability",OBS_GROUP_NORMAL,guides);
+    obs_property_t *nrsize=obs_properties_add_list(p,"nativeProcessingHeight","Native NR processing resolution",OBS_COMBO_TYPE_LIST,OBS_COMBO_FORMAT_INT);
+    obs_property_list_add_int(nrsize,"Source",0);
+    obs_property_list_add_int(nrsize,"480p",480);
+    obs_property_list_add_int(nrsize,"720p",720);
+    obs_property_list_add_int(nrsize,"1080p",1080);
+    obs_property_list_add_int(nrsize,"1440p",1440);
+    obs_property_list_add_int(nrsize,"2160p",2160);
     obs_properties_t *fg=obs_properties_create();
-    obs_properties_add_bool(fg,"captureGuided","Use actual HDMI frames to guide generated motion ·experimental");
     obs_property_t *backend=obs_properties_add_list(fg,"frameGenerationBackend","Interpolation engine",OBS_COMBO_TYPE_LIST,OBS_COMBO_FORMAT_STRING);
     obs_property_list_add_string(backend,"Apple VideoToolbox ·native motion reconstruction","apple");
     obs_property_list_add_string(backend,"MLX ·experimental recovered video model","mlx");
+    obs_property_list_add_string(backend,"RIFE Metal v4.25","rife");
     obs_property_t *factor=obs_properties_add_list(fg,"frameGenerationFactor","Multi-frame generation",OBS_COMBO_TYPE_LIST,OBS_COMBO_FORMAT_INT);
     obs_property_list_add_int(factor,"Off ·base frames only",1);
     obs_property_list_add_int(factor,"2× ·one intermediate per pair",2);
@@ -447,6 +606,10 @@ static obs_properties_t *source_properties(void *data) {
     obs_properties_add_text(p,"status","NR MLX/Metal FP16 + MPS ·NR ANE off ·MFG optional",OBS_TEXT_INFO);
     obs_properties_add_button2(p,"refresh","Refresh runtime measurements",refresh_status,data);
     if(data)refresh_status(p,NULL,data);
+    for(NSString *key in @[@"upscaling",@"diffuseWhite",@"hdrStrength",@"colorStrength",@"motionScaleX",@"motionScaleY",@"noiseFrame",@"uiCorrection",@"uiX",@"uiY",@"uiWidth",@"uiHeight",@"srPath"]) {
+        obs_property_t *property=obs_properties_get(p,key.UTF8String);
+        if(property)obs_property_set_enabled(property,false);
+    }
     return p;
 }
 static void open_nr_menu(void *unused) {
@@ -484,6 +647,7 @@ bool obs_module_load(void) {
     info.get_width=source_width; info.get_height=source_height; info.video_render=source_render;
     info.icon_type=OBS_ICON_TYPE_CAMERA;
     obs_register_source(&info);
+    register_dlss5nr_filter();
     obs_frontend_add_tools_menu_item("DLSS 5",open_nr_menu,NULL);
     obs_frontend_add_event_callback(frontend_event,NULL);
     return true;
