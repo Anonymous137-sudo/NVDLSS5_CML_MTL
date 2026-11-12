@@ -19,3 +19,8 @@ void nr_handle_release(void *handle);
 void nr_status(void *handle,char *text,int32_t size);
 void nr_set_status_overlay(void *handle,bool enabled);
 void nr_show_preview(void *handle);
+
+void nr_hide_output(void *handle);
+void nr_show_screen_filter(void *handle,uint32_t display);
+
+void nr_set_metrics_overlay(void *handle,bool enabled);

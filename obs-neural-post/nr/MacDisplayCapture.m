@@ -45,10 +45,16 @@
             for(SCRunningApplication *app in content.applications)if(app.processID==getpid())[excluded addObject:app];
             SCContentFilter *filter=[[SCContentFilter alloc] initWithDisplay:chosen excludingApplications:excluded exceptingWindows:@[]];
             SCStreamConfiguration *config=[SCStreamConfiguration new];
-            config.width=1920;config.height=1080;config.minimumFrameInterval=CMTimeMake(1,60);
+            config.width=1920;config.height=1080;
+            if(self.nativeAspect) {
+                double aspect=(double)CGDisplayPixelsWide(chosen.displayID)/MAX(1,CGDisplayPixelsHigh(chosen.displayID));
+                config.height=(size_t)(MIN(1080.0,1920.0/aspect)/2)*2;
+                config.width=(size_t)(config.height*aspect/2)*2;
+            }
+            config.minimumFrameInterval=CMTimeMake(1,60);
             config.pixelFormat=kCVPixelFormatType_420YpCbCr8BiPlanarFullRange;
             config.colorSpaceName=kCGColorSpaceSRGB;config.colorMatrix=kCGDisplayStreamYCbCrMatrix_ITU_R_709_2;
-            config.queueDepth=3;config.showsCursor=YES;config.capturesAudio=NO;
+            config.queueDepth=3;config.showsCursor=!self.nativeAspect;config.capturesAudio=NO;
             config.scalesToFit=YES;config.preservesAspectRatio=YES;
             config.streamName=@"DLSS 5 Mac display input";
             if(@available(macOS 15.0,*))config.captureDynamicRange=SCCaptureDynamicRangeSDR;

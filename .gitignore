@@ -24,3 +24,5 @@ __pycache__/
 MLX-DLSS
 .deps
 models
+
+/rife-metal

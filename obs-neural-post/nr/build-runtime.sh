@@ -3,7 +3,7 @@ set -euo pipefail
 project_dir="$(cd "$(dirname "$0")/.." && pwd)"
 backend_dir="$project_dir/../MLX-DLSS"
 products="$backend_dir/.build/release"
-rife_dir="${DLSS_RIFE_METAL_DIR:-$project_dir/../../../rife-metal}"
+rife_dir="${DLSS_RIFE_METAL_DIR:-$project_dir/../rife-metal}"
 rife_products="$rife_dir/.build/release"
 out="$project_dir/build/nr"
 (cd "$backend_dir" && swift build -c release --product mlxdlss)

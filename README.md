@@ -6,7 +6,7 @@ The current capture path accepts 1080p NV12 SDR. Processing resolution is config
 
 Direct ANEForge/IOSurface and mixed-precision experiments are in `obs-neural-post/tools/aneforge`. They are explicitly experimental: neither the rejected quantized candidates nor the slower hybrid partitions are enabled in live NR. See that directory's README for measured numerical gates and costs.
 
-Mac display capture is documented in [the capture guide](obs-neural-post/nr/MAC_DISPLAY_CAPTURE.md). This source snapshot retains the optional OBS integration; an OBS-free native host is the next development target.
+The primary host is now **NVDLSS5.app**, with two modes: **Mac screen filter** and **external HDMI / ProMotion window**. It uses native AppKit, ScreenCaptureKit, AVFoundation and Metal without loading OBS or its compositor. See the [native host guide](obs-neural-post/standalone/README.md). The previous OBS plugin remains as an optional legacy integration.
 
 | Mode | Appearance passes |
 | --- | --- |
@@ -18,9 +18,22 @@ Mac display capture is documented in [the capture guide](obs-neural-post/nr/MAC_
 
 The DLSS 5 controls include temporal NR, a configurable HUD region, and mutually exclusive Final and Per-Layer intensity modes. Optional frame generation uses RIFE Metal, MLX or Apple VideoToolbox, with a cap of 6×. The native preview supports ProMotion and an RTSS-style overlay that separates fresh frames, generated frames, and display refresh.
 
-## Install and configure
+## Native application
 
-1. Download the Apple Silicon ZIP from [Releases](../../releases), extract it, and quit OBS.
+Open the native application from the source build or a matching release. Choose **Mac screen filter** or **External HDMI · ProMotion window**, select a source and use **Start / apply**. Use **Models** to configure local checkpoints. The menu-bar Stop command removes the filter and stops capture.
+
+The Mac filter is a capture-and-present overlay, not a WindowServer injection. Its output and controls are excluded from capture; pointer events pass through. Full-resolution neural latency remains a major limitation. Mac capture was exercised, but click-through verification and standalone HDMI acceptance are still open. No new live run was made after the user requested that the apps remain closed.
+
+```sh
+python3 dependencies/bootstrap.py
+bash obs-neural-post/standalone/build.sh
+```
+
+This target needs Xcode/Swift and Apple Silicon, **not an OBS installation or OBS headers**. Output: `obs-neural-post/build/standalone/NVDLSS5.app`.
+
+## Optional legacy OBS plugin
+
+1. Download the legacy OBS v0.1.0 plugin ZIP from [Releases](https://github.com/Anonymous137-sudo/NVDLSS5_CML_MTL/releases/tag/v0.1.0), extract it, and quit OBS.
 2. Copy `obs-dlss-nr.plugin` into `~/Library/Application Support/obs-studio/plugins/` as a single bundle. The preview was tested on stock OBS 32.1.0 on Apple Silicon. Apple optical flow requires macOS 15.4 or later and supported hardware.
 3. Open OBS, create or select a scene, then choose **Tools → DLSS 5**. In **Live tools**, select the HDMI capture card and grant camera access when macOS prompts. Use a 1920×1080 OBS canvas for this pipeline.
 4. Open **Live tools → Original OBS source properties**. Point **Model files** and the frame-generation weights field at your local compatible assets. The table below lists the expected formats.
@@ -41,6 +54,8 @@ See [MLX-DLSS model preparation](https://github.com/iamwavecut/MLX-DLSS#weights)
 
 | Binary | Responsibility |
 | --- | --- |
+| `NVDLSS5.app` | Native capture, screen-filter/HDMI window controls; no OBS core |
+| `libdlss5_native.dylib` | Native recovered NR model port |
 | `obs-dlss-nr.plugin` | OBS source, HDMI capture, settings, and delivery of finished frames |
 | `libnvidia_nr.dylib` | Versioned C controller for settings, frame lifetime, telemetry, and preview |
 | `libnvgnx_dlssnr.dylib` | Appearance pipeline, MFG orchestration, frame pacing, and native preview |
@@ -49,13 +64,13 @@ See [MLX-DLSS model preparation](https://github.com/iamwavecut/MLX-DLSS#weights)
 
 The binary names are local compatibility names. This is an independent project with no NVIDIA, Apple, OBS Project, or RTSS affiliation.
 
-## Build from source
+## Optional OBS plugin build
 
 Use Xcode with Swift 6.2 or later, CMake 3.28 or later, Ninja, and installed Apple Silicon OBS. From the repository root, prepare the pinned backend:
 
 ```sh
 git clone https://github.com/iamwavecut/MLX-DLSS.git MLX-DLSS
-git -C MLX-DLSS checkout --detach 7870371e8bf6c03967213f1a5d40db6c5a3bee38
+git -C MLX-DLSS checkout --detach "$(cat dependencies/MLX-DLSS-REVISION)"
 git -C MLX-DLSS apply ../dependencies/mlx-dlss.patch
 ```
 
@@ -69,7 +84,7 @@ The signed bundle is staged under `obs-neural-post/build/stock-obs/`. Use `DLSS_
 
 ## Validation and limitations
 
-The original full-model bundle was exercised on a live PS5 feed in stock OBS 32.1.0. Fidelity at MLX 6× showed roughly 8 fresh and 38.5 generated frames per second in the 120 Hz preview. The 30–45 fresh FPS target remains unmet. Frame generation can show appearance discontinuities during camera motion. HDMI input supplies screen-space pixels, with motion estimated from those pixels.
+The native host has been exercised on Mac screen capture; this does not establish a playable full-resolution rate or a completed click-through test. The original full-model bundle was exercised on a live PS5 feed in stock OBS 32.1.0. A historical lower-resolution Fidelity test at MLX 6× showed roughly 8 fresh and 38.5 generated frames per second in the 120 Hz preview. The 30–45 fresh FPS target remains unmet. Frame generation can show appearance discontinuities during camera motion. HDMI input supplies screen-space pixels, with motion estimated from those pixels.
 
 ## License
 

@@ -1,0 +1,300 @@
+diff --git a/Sources/RifeMetal/RifeStream.swift b/Sources/RifeMetal/RifeStream.swift
+index 7d0a8f8..bcb5e1d 100644
+--- a/Sources/RifeMetal/RifeStream.swift
++++ b/Sources/RifeMetal/RifeStream.swift
+@@ -65,7 +65,15 @@ public final class RifeStream: @unchecked Sendable {
+     ///   producing any output. Useful for skipping a frame in the stream
+     ///   while keeping the cache fresh.
+     public func push(_ frame: CVPixelBuffer,
+-                     timesteps: [Float]) throws -> [CVPixelBuffer] {
++                     timesteps: [Float],
++                     appearance: (MTLTexture, MTLTexture)? = nil) throws -> [CVPixelBuffer] {
++        // The raw input drives all IFNet stages. Optional full-resolution RGB
++        // textures replace only the two source images for the final warp.
++        if let (a, b) = appearance {
++            guard a.width == width, a.height == height, b.width == width, b.height == height else {
++                throw RifeError.dimensionMismatch
++            }
++        }
+         // Validate input dims and format.
+         let frameW = CVPixelBufferGetWidth(frame)
+         let frameH = CVPixelBufferGetHeight(frame)
+@@ -119,7 +127,7 @@ public final class RifeStream: @unchecked Sendable {
+ 
+             try runStreamAndRotate(curr: paddedFrame,
+                                    timesteps: timesteps,
+-                                   outputs: outBuffers)
++                                   outputs: outBuffers, appearance: appearance)
+ 
+             // Crop outputs back to caller-visible dims if we padded.
+             if needsPad {
+@@ -254,7 +262,8 @@ public final class RifeStream: @unchecked Sendable {
+     /// freshly-encoded slot becomes prev for the next call.
+     private func runStreamAndRotate(curr: CVPixelBuffer,
+                                     timesteps: [Float],
+-                                    outputs: [CVPixelBuffer]) throws {
++                                    outputs: [CVPixelBuffer],
++                                    appearance: (MTLTexture, MTLTexture)? = nil) throws {
+         let writeSlot = 1 - prevSlot
+         try graph.runStream(
+             curr: curr,
+@@ -262,7 +271,7 @@ public final class RifeStream: @unchecked Sendable {
+             prevImgIntBuf:  imgIntBuf[prevSlot],  currImgIntBuf:  imgIntBuf[writeSlot],
+             prevImgFullBuf: imgFullBuf[prevSlot], currImgFullBuf: imgFullBuf[writeSlot],
+             timesteps: timesteps,
+-            outputs:   outputs)
++            outputs:   outputs, appearance: appearance)
+         prevSlot = writeSlot
+     }
+ 
+diff --git a/Sources/RifeMetalCore/IFNetGraph.swift b/Sources/RifeMetalCore/IFNetGraph.swift
+index 8c13a20..c6b062e 100644
+--- a/Sources/RifeMetalCore/IFNetGraph.swift
++++ b/Sources/RifeMetalCore/IFNetGraph.swift
+@@ -823,6 +823,8 @@ public final class IFNetGraph {
+                              output: p.finalWarped1Buf,
+                              width: width, height: height)
+ 
++        finalEnc.setTexture(p.finalFlowTex0, index: 1)
++        finalEnc.setTexture(p.finalFlowTex1, index: 2)
+         if useInternalScale {
+             finalEnc.setComputePipelineState(conv.blendUpsampleMaskAndPack)
+             finalEnc.setBuffer(p.finalWarped0Buf, offset: 0, index: 0)
+@@ -949,7 +951,8 @@ public final class IFNetGraph {
+                           prevImgIntBuf:  MTLBuffer, currImgIntBuf:  MTLBuffer,
+                           prevImgFullBuf: MTLBuffer, currImgFullBuf: MTLBuffer,
+                           timesteps:      [Float],
+-                          outputs:        [CVPixelBuffer]) throws {
++                          outputs:        [CVPixelBuffer],
++                          appearance:     (MTLTexture, MTLTexture)? = nil) throws {
+         precondition(timesteps.count == outputs.count,
+                      "timesteps and outputs must have matching counts")
+         // 输出可以裁剪，但不得超出完整推理网格。
+@@ -998,7 +1001,6 @@ public final class IFNetGraph {
+         // Bind caller-provided prev/curr buffers for the prev/curr image and feat tensors.
+         let img0IntTD = MPSGraphTensorData(prevImgIntBuf, shape: intRGBShape, dataType: .float16)
+         let img1IntTD = MPSGraphTensorData(currImgIntBuf, shape: intRGBShape, dataType: .float16)
+-        let tTD       = MPSGraphTensorData(p.tBuf,        shape: maskShape,   dataType: .float16)
+ 
+         let f0TD = MPSGraphTensorData(prevFeatBuf, shape: intFeat4Shape, dataType: .float16)
+         let f1TD = MPSGraphTensorData(currFeatBuf, shape: intFeat4Shape, dataType: .float16)
+@@ -1118,26 +1120,19 @@ public final class IFNetGraph {
+             enc.endEncoding()
+         }
+ 
+-        // 4. Per-timestep: set t, run all 5 stages, then full-res warp+blend+writeout.
+-        //    Mirrors `interpolate(timesteps:)` which calls run() per timestep.
+-        //    Encoder Head + RGB conversions + texture expansions above are timestep-independent
+-        //    and run once. For multi-timestep we must commit the prep work first so the
+-        //    fresh cb in iteration 1+ sees populated pool textures.
+-        let multiTimestep = timesteps.count > 1
+-        if multiTimestep {
+-            mpsCB.commit()
+-            mpsCB.waitUntilCompleted()
+-        }
+-
+-        for (outIdx, t) in timesteps.enumerated() {
+-            pool.setTimestep(t)
+-            if multiTimestep {
+-                guard let cb2 = queue.makeCommandBuffer() else {
+-                    throw IFNetError.commandBufferFailed("per-timestep makeCommandBuffer failed")
+-                }
+-                mpsCB = MPSCommandBuffer(commandBuffer: cb2)
++        // Each phase owns its timestep storage. The command queue orders
++        // phase reads and writes of tracked scratch resources without a CPU
++        // wait between outputs. Keep the tensors alive through GPU completion.
++        let phaseTensors = try timesteps.map { phase -> MPSGraphTensorData in
++            guard let buffer = context.device.makeBuffer(length: p.tBuf.length, options: .storageModeShared) else {
++                throw IFNetError.textureAllocationFailed
+             }
+-
++            let count = buffer.length / MemoryLayout<UInt16>.stride
++            buffer.contents().bindMemory(to: UInt16.self, capacity: count)
++                .initialize(repeating: HalfPrecision.floatToBits(phase), count: count)
++            return MPSGraphTensorData(buffer, shape: maskShape, dataType: .float16)
++        }
++        for (outIdx, tTD) in phaseTensors.enumerated() {
+             var accFlowTD: MPSGraphTensorData? = nil
+             var accMaskTD: MPSGraphTensorData? = nil
+             var accFlowBuf: MTLBuffer? = nil
+@@ -1346,8 +1341,6 @@ public final class IFNetGraph {
+                 enc.setTexture(outTex, index: 0)
+                 dispatch2D(enc, conv.rgbToBGRA, gridW: width, gridH: height)
+                 enc.endEncoding()
+-                mpsCB.commit()
+-                mpsCB.waitUntilCompleted()
+                 continue
+             }
+ 
+@@ -1379,16 +1372,18 @@ public final class IFNetGraph {
+             }
+ 
+             warp.encodeToBuffer(into: finalEnc,
+-                                 source: p.srcTex0Full,
++                                 source: appearance?.0 ?? p.srcTex0Full,
+                                  flow: p.finalFlowTex0,
+                                  output: p.finalWarped0Buf,
+                                  width: width, height: height)
+             warp.encodeToBuffer(into: finalEnc,
+-                                 source: p.srcTex1Full,
++                                 source: appearance?.1 ?? p.srcTex1Full,
+                                  flow: p.finalFlowTex1,
+                                  output: p.finalWarped1Buf,
+                                  width: width, height: height)
+ 
++            finalEnc.setTexture(p.finalFlowTex0, index: 1)
++            finalEnc.setTexture(p.finalFlowTex1, index: 2)
+             let cropped = outTex.width != width || outTex.height != height
+             let blendMask = cropped ? conv.blendUpsampleMaskAndPackCropped : conv.blendUpsampleMaskAndPack
+             if cropped {
+@@ -1414,19 +1409,21 @@ public final class IFNetGraph {
+             }
+             finalEnc.endEncoding()
+ 
+-            if gpuTimingEnabled && outIdx == timesteps.count - 1 {
+-                let cbRef = mpsCB.commandBuffer
+-                cbRef.addCompletedHandler { cb in
+-                    let gpuMs = (cb.gpuEndTime - cb.gpuStartTime) * 1000
+-                    let kernelMs = (cb.kernelEndTime - cb.kernelStartTime) * 1000
+-                    let line = String(format: "[bench] stream gpu=%.2f ms kernel=%.2f ms\n", gpuMs, kernelMs)
+-                    FileHandle.standardError.write(Data(line.utf8))
+-                }
++        }
++        if gpuTimingEnabled {
++            mpsCB.commandBuffer.addCompletedHandler { cb in
++                let gpuMs = (cb.gpuEndTime - cb.gpuStartTime) * 1000
++                let line = String(format: "[bench] stream batch gpu=%.2f ms\n", gpuMs)
++                FileHandle.standardError.write(Data(line.utf8))
+             }
+-
++        }
++        withExtendedLifetime(phaseTensors) {
+             mpsCB.commit()
+             mpsCB.waitUntilCompleted()
+-        }  // end per-timestep loop
++        }
++        guard mpsCB.commandBuffer.status == .completed else {
++            throw IFNetError.commandBufferFailed(mpsCB.commandBuffer.error?.localizedDescription ?? "stream batch failed")
++        }
+     }
+ 
+     // MARK: - Per-stage debug dump (gated by RIFE_DUMP_DIR env var)
+diff --git a/Sources/RifeMetalCore/Shaders/BackwardWarp.metal b/Sources/RifeMetalCore/Shaders/BackwardWarp.metal
+index ca44b17..6798f67 100644
+--- a/Sources/RifeMetalCore/Shaders/BackwardWarp.metal
++++ b/Sources/RifeMetalCore/Shaders/BackwardWarp.metal
+@@ -162,14 +162,38 @@ kernel void rifeRGBToBGRA(
+ ///
+ /// out = w0 * sigmoid(mask) + w1 * (1 - sigmoid(mask))   then write as BGRA8 (alpha=1).
+ ///
++// For the backward map x -> x + flow(x), a negative determinant reverses
++// local orientation. Taper the visibility adjustment before the map folds.
++static float rifeWarpConfidence(texture2d<half, access::read> flow, uint2 p) {
++    uint left = p.x == 0 ? 0 : p.x - 1;
++    uint right = min(p.x + 1, flow.get_width() - 1);
++    uint top = p.y == 0 ? 0 : p.y - 1;
++    uint bottom = min(p.y + 1, flow.get_height() - 1);
++    float2 dx = (float2(flow.read(uint2(right,p.y)).rg) -
++                 float2(flow.read(uint2(left,p.y)).rg)) / float(max(1u,right-left));
++    float2 dy = (float2(flow.read(uint2(p.x,bottom)).rg) -
++                 float2(flow.read(uint2(p.x,top)).rg)) / float(max(1u,bottom-top));
++    float det = (1.f + dx.x) * (1.f + dy.y) - dx.y * dy.x;
++    return isfinite(det) ? smoothstep(0.f, .25f, det) : 0.f;
++}
++
++static half rifeVisibility(half learned, texture2d<half, access::read> flowA,
++                           texture2d<half, access::read> flowB, uint2 p) {
++    float difference = rifeWarpConfidence(flowA,p) - rifeWarpConfidence(flowB,p);
++    // Equal confidence keeps the learned mask, including when both maps fold.
++    return half(mix(float(learned), difference >= 0.f ? 1.f : 0.f, abs(difference)));
++}
++
+ /// Replaces the legacy (MPSGraph blend executable + rifeRGBToBGRA) pair with a single
+-/// full-res pass. Math is identical (sigmoid + linear blend). At 4K this saves one full-res
++/// full-res pass. Applies geometric confidence to the learned visibility. At 4K this saves one full-res
+ /// RGB read/write (~24 MB bandwidth) and one MPSGraph encode.
+ kernel void rifeBlendAndPack(
+     device const half *warped0  [[buffer(0)]],
+     device const half *warped1  [[buffer(1)]],
+     device const half *mask     [[buffer(2)]],   // pre-sigmoid logits
+     texture2d<half, access::write> output [[texture(0)]],
++    texture2d<half, access::read> flowA [[texture(1)]],
++    texture2d<half, access::read> flowB [[texture(2)]],
+     uint2 gid                   [[thread_position_in_grid]]
+ ) {
+     uint W = output.get_width(), H = output.get_height();
+@@ -185,6 +209,7 @@ kernel void rifeBlendAndPack(
+     // sigmoid(x) = 1 / (1 + exp(-x))
+     half mSig = 1.0h / (1.0h + exp(-m));
+ 
++    mSig = rifeVisibility(mSig,flowA,flowB,gid);
+     half3 blended = w0 * mSig + w1 * (1.0h - mSig);
+ 
+     output.write(half4(blended.r, blended.g, blended.b, 1.0h), gid);
+@@ -200,6 +225,8 @@ kernel void rifeBlendUpsampleMaskAndPack(
+     device const half *maskInternal  [[buffer(2)]],   // pre-sigmoid logits, [1, iH, iW, 1]
+     constant uint2 &internalDim      [[buffer(3)]],   // (iW, iH)
+     texture2d<half, access::write> output [[texture(0)]],
++    texture2d<half, access::read> flowA [[texture(1)]],
++    texture2d<half, access::read> flowB [[texture(2)]],
+     uint2 gid                        [[thread_position_in_grid]]
+ ) {
+     uint W = output.get_width(), H = output.get_height();
+@@ -233,6 +260,7 @@ kernel void rifeBlendUpsampleMaskAndPack(
+     half mh = half(m);
+     half mSig = 1.0h / (1.0h + exp(-mh));
+ 
++    mSig = rifeVisibility(mSig,flowA,flowB,gid);
+     half3 blended = w0 * mSig + w1 * (1.0h - mSig);
+     output.write(half4(blended.r, blended.g, blended.b, 1.0h), gid);
+ }
+@@ -245,6 +273,8 @@ kernel void rifeBlendUpsampleMaskAndPackCropped(
+     constant uint2 &internalDim      [[buffer(3)]],   // (iW, iH)
+     constant uint2 &sourceDim [[buffer(4)]],
+     texture2d<half, access::write> output [[texture(0)]],
++    texture2d<half, access::read> flowA [[texture(1)]],
++    texture2d<half, access::read> flowB [[texture(2)]],
+     uint2 gid                        [[thread_position_in_grid]]
+ ) {
+     uint W = sourceDim.x, H = sourceDim.y;
+@@ -278,6 +308,7 @@ kernel void rifeBlendUpsampleMaskAndPackCropped(
+     half mh = half(m);
+     half mSig = 1.0h / (1.0h + exp(-mh));
+ 
++    mSig = rifeVisibility(mSig,flowA,flowB,gid);
+     half3 blended = w0 * mSig + w1 * (1.0h - mSig);
+     output.write(half4(blended.r, blended.g, blended.b, 1.0h), gid);
+ }
+diff --git a/Tests/RifeMetalTests/RifeStreamTests.swift b/Tests/RifeMetalTests/RifeStreamTests.swift
+index fbc8481..9b8a376 100644
+--- a/Tests/RifeMetalTests/RifeStreamTests.swift
++++ b/Tests/RifeMetalTests/RifeStreamTests.swift
+@@ -208,6 +208,28 @@ final class RifeStreamTests: XCTestCase {
+         }
+     }
+ 
++    func testFastStreamAllMultipliersMatchIndependentPhases() throws {
++        let interp = try makeInterpolator(tier: .fast)
++        let fixtures = URL(fileURLWithPath: #filePath)
++            .deletingLastPathComponent().deletingLastPathComponent().appendingPathComponent("fixtures")
++        let a = try loadFixturePixelBuffer(fixtures.appendingPathComponent("frame_a.png"))
++        let b = try loadFixturePixelBuffer(fixtures.appendingPathComponent("frame_b.png"))
++        let stream = try interp.makeStream(width: CVPixelBufferGetWidth(a), height: CVPixelBufferGetHeight(a))
++
++        for factor in 2...6 {
++            let phases = (1..<factor).map { Float($0) / Float(factor) }
++            let expected = try interp.interpolate(previous: a, current: b, timesteps: phases)
++            stream.reset()
++            XCTAssertTrue(try stream.push(a, timesteps: []).isEmpty)
++            let actual = try stream.push(b, timesteps: phases)
++            XCTAssertEqual(actual.count, phases.count)
++            for (i, pair) in zip(actual, expected).enumerated() {
++                XCTAssertGreaterThan(PSNRHelper.compareInMemory(pair.0, pair.1), 50,
++                                     "factor \(factor), phase \(phases[i])")
++            }
++        }
++    }
++
+     func testStreamCallerOutput_matchesStateless() throws {
+         let interp = try makeInterpolator()
+         let fixturesDir = URL(fileURLWithPath: #filePath)

@@ -7,6 +7,7 @@ import DLSSNR
 private final class NRBridge {
  let pipeline:PostPipeline
  var window:NSWindow?
+ var filterWindow:NSWindow?
  init(_ config:NRConfiguration)throws {pipeline=try PostPipeline(config)}
 }
 private func config(_ text:UnsafePointer<CChar>)throws->NRConfiguration {try JSONDecoder().decode(NRConfiguration.self,from:Data(String(cString:text).utf8)).checked()}
@@ -26,7 +27,7 @@ private func config(_ text:UnsafePointer<CChar>)throws->NRConfiguration {try JSO
 }
 @_cdecl("nr_destroy") public func nrDestroy(_ handle:UnsafeMutableRawPointer?) {
  guard let handle else{return};let bridge=Unmanaged<NRBridge>.fromOpaque(handle).takeRetainedValue();bridge.pipeline.stop()
- DispatchQueue.main.async {bridge.window?.close();bridge.window=nil}
+ DispatchQueue.main.async {bridge.window?.close();bridge.window=nil;bridge.filterWindow?.close();bridge.filterWindow=nil}
 }
 @_cdecl("nr_submit") public func nrSubmit(_ handle:UnsafeMutableRawPointer?,_ buffer:UnsafeMutableRawPointer?,_ sequence:UInt64,_ pts:Double) {
  guard let handle,let buffer else{return}
@@ -63,5 +64,34 @@ private func config(_ text:UnsafePointer<CChar>)throws->NRConfiguration {try JSO
   }
   NSApplication.shared.activate()
   bridge.window?.makeKeyAndOrderFront(nil)
+ }
+}
+
+@_cdecl("nr_hide_output") public func nrHideOutput(_ handle:UnsafeMutableRawPointer?) {
+ guard let handle else{return};let bridge=Unmanaged<NRBridge>.fromOpaque(handle).takeUnretainedValue()
+ DispatchQueue.main.async {bridge.window?.orderOut(nil);bridge.filterWindow?.orderOut(nil)}
+}
+@_cdecl("nr_show_screen_filter") public func nrShowScreenFilter(_ handle:UnsafeMutableRawPointer?,_ display:UInt32) {
+ guard let handle else{return};let bridge=Unmanaged<NRBridge>.fromOpaque(handle).takeUnretainedValue()
+ DispatchQueue.main.async {
+  guard let screen=NSScreen.screens.first(where:{($0.deviceDescription[NSDeviceDescriptionKey("NSScreenNumber")] as? NSNumber)?.uint32Value==display}) else{return}
+  bridge.filterWindow?.close();bridge.filterWindow=nil;bridge.window?.orderOut(nil)
+  do {
+   let view=try NativePresenter(pipeline:bridge.pipeline)
+   let window=NSWindow(contentRect:screen.frame,styleMask:.borderless,backing:.buffered,defer:false)
+   window.isReleasedWhenClosed=false;window.contentView=view;window.ignoresMouseEvents=true
+   window.level = .floating;window.collectionBehavior=[.canJoinAllSpaces,.fullScreenAuxiliary,.stationary]
+   window.backgroundColor = .black;window.isOpaque=true;window.setFrame(screen.frame,display:true)
+   bridge.filterWindow=window;window.orderFrontRegardless()
+  } catch {fputs("DLSS screen filter: \(error)\n",stderr)}
+ }
+}
+
+@_cdecl("nr_set_metrics_overlay") public func nrSetMetricsOverlay(_ handle:UnsafeMutableRawPointer?,_ enabled:Bool) {
+ guard let handle else{return};let bridge=Unmanaged<NRBridge>.fromOpaque(handle).takeUnretainedValue()
+ DispatchQueue.main.async {
+  UserDefaults.standard.set(enabled,forKey:"DLSS.NativeStatsVisible")
+  (bridge.window?.contentView as? NativePresenter)?.setMetricsVisible(enabled)
+  (bridge.filterWindow?.contentView as? NativePresenter)?.setMetricsVisible(enabled)
  }
 }

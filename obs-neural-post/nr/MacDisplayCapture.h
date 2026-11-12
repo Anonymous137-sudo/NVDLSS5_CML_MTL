@@ -6,6 +6,7 @@
 // Start/stop belong to the supplied serial control queue. Samples are delivered
 // on the existing capture queue; the block must consume/retain them before return.
 @interface MacDisplayCapture : NSObject
+@property BOOL nativeAspect;
 @property(atomic, readonly) BOOL running;
 @property(atomic, readonly) BOOL starting;
 @property(atomic, readonly) CGDirectDisplayID displayID;

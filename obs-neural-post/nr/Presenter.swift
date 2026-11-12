@@ -131,6 +131,10 @@ public final class NativePresenter: NSView, CAMetalDisplayLinkDelegate {
         lastSourceAgeMS = (now-frame.sourceSeconds)*1000
     }
     public override var acceptsFirstResponder:Bool {true}
+    public func setMetricsVisible(_ enabled:Bool) {
+        statsVisible=enabled;statsHUD.isHidden = !enabled
+        UserDefaults.standard.set(enabled,forKey:"DLSS.NativeStatsVisible");needsLayout=true
+    }
     public override func keyDown(with event:NSEvent) {if event.keyCode==100 {statsVisible.toggle();statsHUD.isHidden = !statsVisible;UserDefaults.standard.set(statsVisible,forKey:"DLSS.NativeStatsVisible");needsLayout=true}else{super.keyDown(with:event)}}
     public func stop() { link?.invalidate(); link = nil;pipeline.reportPresentation(["active":false]) }
     deinit { link?.invalidate() }
